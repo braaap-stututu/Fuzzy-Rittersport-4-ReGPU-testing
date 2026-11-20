@@ -19,3 +19,25 @@
 #define FM4_XAPI_CREATE_FIBER            sub_82C82AD0
 #define FM4_XAPI_DELETE_FIBER            sub_82C82BB0
 #define FM4_XAPI_SWITCH_TO_FIBER         sub_82C85380
+
+// Test tools (hooks/fm4/frame_time.cpp, race_start.cpp, ai_player.cpp; docs: FM4-BENCHMARK-RESEARCH.md in the
+// workspace). Found by matching the FM3 port's hooks (FM3's engine is FM4's predecessor) through the same
+// strings and RTTI classes; the FM3 counterparts are named after each.
+//   Main loop sub_822F74A0 (FM3 sub_821F5DE8): after waiting for its frame, r30 = milliseconds since the last
+//     frame (over 4000: 16), f31 = r30 * 0.001, then the frame-time check below; true = take f31 as it is,
+//     false = the 16/17 ms snap to 1/59.94 with a carried remainder. The frame time is stored at +408.
+//   Frame-time check sub_822D3EB8 (FM3 sub_821F6AF8), called from the main loop with this return address.
+//   Race-start sequence update sub_8239D018 (FM3 sub_822E6AD0): r3 = the sequence, f1 = dt; the only function
+//     reading both OverrideRevsDuration (0x82DDB280) and PreRaceCamsFadeOut (0x82DDB320) of 321Tuning.xml.
+//     Countdown clock: double at +16; flags: bytes +24..+32 (FM3: +24 intro, +25 start taken, +26 GO; FM4's
+//     function starts on +26 set and +27 clear where FM3's starts on +25 set and +26 clear).
+//   Car driver setup sub_82A9E110(car, params) (FM3 sub_828F8858): car+104 == 0 (the player's car) makes a
+//     CHumanDriver (ctor sub_82A92A80, vtable 0x82002360); opponents get the physics calls on car+2072 and an AI
+//     driver from the factory sub_82A9DE48(car, params); params[0] is the entry's type (3 player, 2 opponent).
+#define FM4_MAIN_LOOP_FRAME_TIME_CHECK      sub_822D3EB8
+#define FM4_MAIN_LOOP_FRAME_TIME_CHECK_IMPL __imp__sub_822D3EB8
+#define FM4_FRAME_TIME_CHECK_RETURN         0x822F776Cu
+#define FM4_RACE_START_UPDATE               sub_8239D018
+#define FM4_RACE_START_UPDATE_IMPL          __imp__sub_8239D018
+#define FM4_CAR_DRIVER_SETUP                sub_82A9E110
+#define FM4_CAR_DRIVER_SETUP_IMPL           __imp__sub_82A9E110

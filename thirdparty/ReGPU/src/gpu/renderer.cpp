@@ -236,6 +236,9 @@ void ForEachAliasRun(const EdramAlias& alias, const D3D12_RECT& r, Fn&& fn)
 std::atomic<uint32_t> g_nativeMsaaGeneration{ 0 }; // bumped when an entry changes (BigPassSize's memo)
 void SetNativeMsaa(uint32_t key, uint32_t msaa)
 {
+    // Almost every draw stores what the slot already holds: a plain load first, the locked exchange only on a change.
+    if (NativeSlot(key).load(std::memory_order_relaxed) == (key << 2 | msaa))
+        return;
     if (NativeSlot(key).exchange(key << 2 | msaa, std::memory_order_relaxed) != (key << 2 | msaa))
         g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
 }
@@ -434,6 +437,7 @@ struct CompiledShader
     TranslatedShader info;
     const CompiledShader* hlslSource = nullptr; // canonical variants: the shader whose code (and HLSL) this reuses
     mutable const CompiledShader* motion = nullptr; // its motion-vector variant, once looked up
+    mutable const CompiledShader* noKill = nullptr; // pixel shaders: the variant without the alpha test (NoKillShader)
     uint32_t tag = 0; // the game's mark for this shader (Host::rewriteShader), passed to Host::onDraw
     bool IsReady() const { return state.load(std::memory_order_acquire) == Ready; }
 };
@@ -496,6 +500,12 @@ struct FrameResources
     ComPtr<ID3D12Resource> ring;
     uint8_t* ringCpu = nullptr;
     UINT64 ringSize = 0; // bytes in `ring` (kRingSize when it was made; a grown ring reaches the next frames)
+    // REGPU_GPU_UPLOAD_RING (live; after the FM3 port's regpu-gpu-upload-ring): the same ring in a GPU upload heap
+    // (VRAM the CPU writes through resizable BAR), swapped with `ring` at this slot's frame start.
+    ComPtr<ID3D12Resource> ringAlt;
+    uint8_t* ringAltCpu = nullptr;
+    UINT64 ringAltSize = 0;
+    bool ringInVram = false;
     std::atomic<UINT64> ringUsed{ 0 }; // draw workers allocate concurrently
     std::atomic<uint32_t> ringRefused{ 0 }; // allocations the full ring refused this frame (a draw skipped or a texture missing each)
     // Guest ranges already uploaded this frame: (address << 32 | bytes) -> (offset, sample hash).
@@ -1125,6 +1135,33 @@ D3D12_GPU_DESCRIPTOR_HANDLE Gpu(ID3D12DescriptorHeap* heap, UINT index, UINT str
     return h;
 }
 
+bool g_gpuUploadHeap = false; // GPU upload heaps reported and allowed (see the ring set-up in Init)
+
+// An upload ring in a GPU upload heap, mapped (write-combined VRAM: the CPU must only write it); null if refused.
+ComPtr<ID3D12Resource> CreateGpuUploadRing(UINT64 size, uint8_t*& cpu)
+{
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_GPU_UPLOAD;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = size;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> r;
+    cpu = nullptr;
+    const HRESULT hr = g_r.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+    if (FAILED(hr) || FAILED(r->Map(0, nullptr, reinterpret_cast<void**>(&cpu))) || !cpu)
+    {
+        Log("renderer: GPU upload heap ring of %llu MB failed (0x%08X): the ring stays in system memory", (unsigned long long)(size >> 20), unsigned(hr));
+        cpu = nullptr;
+        return nullptr;
+    }
+    return r;
+}
+
 ComPtr<ID3D12Resource> CreateBuffer(UINT64 size, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state)
 {
     D3D12_HEAP_PROPERTIES hp{};
@@ -1461,6 +1498,16 @@ void Init()
     kRingSize = (getenv("REGPU_RING_MB") ? std::clamp<UINT64>(UINT64(atoi(getenv("REGPU_RING_MB"))), 16, 2048)
         : g_r.physical && !getenv("REGPU_NO_DIRECT_FETCH") ? (OutputHeight() > 1080 ? 256 : 64) : 384) << 20;
     Log("renderer: upload ring %llu MB per frame", (unsigned long long)(kRingSize >> 20));
+    // GPU upload heaps (D3D12 OPTIONS16; reported with resizable BAR / Smart Access Memory on): a second ring per frame
+    // slot is made there for REGPU_GPU_UPLOAD_RING (REGPU_NO_GPU_UPLOAD_RING=1: not made). Every draw's constants, vertex
+    // data and index lists are read by the GPU from this ring: from VRAM it doesn't wait on system memory for them.
+    {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16{};
+        const bool queried = SUCCEEDED(d->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof(o16)));
+        g_gpuUploadHeap = queried && o16.GPUUploadHeapSupported && !getenv("REGPU_NO_GPU_UPLOAD_RING");
+        Log("renderer: GPU upload heaps %s", !queried ? "unknown (OPTIONS16 not reported)" : o16.GPUUploadHeapSupported ? "supported (resizable BAR on)"
+                                                                                                                       : "not supported (resizable BAR off or unsupported)");
+    }
     for (UINT i = 0; i < kFrames; i++)
     {
         FrameResources& f = g_r.frames[i];
@@ -1468,6 +1515,9 @@ void Init()
         f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
         f.ringSize = kRingSize;
+        if (g_gpuUploadHeap && !(f.ringAlt = CreateGpuUploadRing(kRingSize, f.ringAltCpu)))
+            g_gpuUploadHeap = false;
+        f.ringAltSize = f.ringAlt ? kRingSize : 0;
         f.descriptorBase = i * kDescriptorsPerFrame;
     }
     Check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_r.frames[0].allocator.Get(), nullptr, IID_PPV_ARGS(&g_r.realList)),
@@ -1992,10 +2042,42 @@ void BeginFrameIfNeeded()
         if (f.ringSize < kRingSize && !noGrow)
         {
             f.garbage.push_back(std::move(f.ring));
-            f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-            f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+            uint8_t* cpu = nullptr;
+            if (f.ringInVram && (f.ring = CreateGpuUploadRing(kRingSize, cpu)))
+                f.ringCpu = cpu;
+            else
+            {
+                if (f.ringInVram)
+                {
+                    // (VRAM refused: back to system memory for good; the old VRAM ring goes too.)
+                    f.ringInVram = false;
+                    f.garbage.push_back(std::move(f.ringAlt));
+                    f.ringAltCpu = nullptr;
+                    f.ringAltSize = 0;
+                }
+                f.ring = CreateBuffer(kRingSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+                f.ring->Map(0, nullptr, reinterpret_cast<void**>(&f.ringCpu));
+            }
             f.ringSize = kRingSize;
         }
+    }
+    // REGPU_GPU_UPLOAD_RING: this slot's ring in VRAM or system memory (its last use finished with its frame). Not with a
+    // temporal upscaler: its motion bookkeeping reads last frame's constants back from the ring (PreviousRingFloats),
+    // and reading VRAM over the bus is very slow.
+    if (static LiveSwitch vramRing("REGPU_GPU_UPLOAD_RING"); f.ringAlt)
+    {
+        const Settings& st = GetSettings();
+        const bool temporalUpscaler = st.upscaler == Settings::Upscaler::Dlss || st.upscaler == Settings::Upscaler::Fsr3 ||
+            st.upscaler == Settings::Upscaler::Fsr4;
+        if ((bool(vramRing) && !temporalUpscaler) != f.ringInVram)
+    {
+        std::swap(f.ring, f.ringAlt);
+        std::swap(f.ringCpu, f.ringAltCpu);
+        std::swap(f.ringSize, f.ringAltSize);
+        f.ringInVram = !f.ringInVram;
+        if (&f == &g_r.frames[0])
+            Log("renderer: upload ring in %s", f.ringInVram ? "VRAM (GPU upload heap)" : "system memory");
+    }
     }
     f.ringUsed = 0;
     f.uploads.clear();
@@ -2749,12 +2831,15 @@ std::unordered_map<uint64_t, uint64_t> g_psEditAlias; // shader -> alias
 std::unordered_map<uint64_t, std::string> g_psEditExpr; // alias -> the expression it returns
 std::atomic<bool> g_psEdits{ false };
 std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+std::atomic<bool> g_psEditEverAny{ false };  // g_psEditEver isn't empty (IsPsEditAlias runs several times a draw: no lock until then)
 // The debug server's drawstats: draws per (vs, ps) over one frame.
 std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
 std::mutex g_drawStatsMutex;
 std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
 bool IsPsEditAlias(uint64_t hash)
 {
+    if (!g_psEditEverAny.load(std::memory_order_acquire))
+        return false;
     std::lock_guard lock(g_psEditMutex);
     return g_psEditEver.count(hash) != 0;
 }
@@ -3120,6 +3205,182 @@ const CompiledShader* MotionShaderLookup(const CompiledShader& base)
     }
     g_compiler.Push(&cs, false);
     return &cs;
+}
+
+// REGPU_SPLIT_ALPHA_TEST=1 (live; after the FM3 port's regpu-split-alpha-test): draws with the alpha test off
+// (function "always", or a depth-only pass) and alpha-to-mask off use a variant of their pixel shader without the
+// run-time alpha test. The test is a switch on pinfo.x ending in `discard`, so every translated pixel shader may
+// discard, and a PC GPU then can't reject hidden pixels before running the shader (early depth). Xenos tests alpha
+// after the shader in fixed function. Guest kill instructions stay. The variant's pipelines (flag kNoKillFlag) are
+// built in the background and not stored in the pipeline manifest: until one is ready the draw uses the base pipeline.
+constexpr uint32_t kNoKillFlag = 0x01000000; // pipeline key flags: bits 0-3 and 8-23 are taken
+std::string NoKillVariant(const std::string& hlsl)
+{
+    const std::string startMark = "    switch (pinfo.x)\n    {\n";
+    const size_t a = hlsl.find(startMark);
+    const size_t b = a == std::string::npos ? std::string::npos : hlsl.find("    }\n", a + startMark.size());
+    if (b == std::string::npos || hlsl.find(startMark, a + 1) != std::string::npos)
+        return {};
+    std::string h = hlsl;
+    h.erase(a, b + 6 - a);
+    return h;
+}
+
+std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> g_noKillShaders;
+// The ready variant, or nullptr (still compiling, or it can't be made). Compiled on first use.
+const CompiledShader* NoKillShader(const CompiledShader& base)
+{
+    if (const CompiledShader* k = base.noKill)
+        return k->IsReady() ? k : nullptr;
+    std::lock_guard lock(g_shaderMutex);
+    if (!base.noKill)
+    {
+        const CompiledShader& source = base.hlslSource ? *base.hlslSource : base;
+        auto [it, inserted] = g_noKillShaders.try_emplace(source.cacheKey);
+        if (inserted)
+        {
+            it->second = std::make_unique<CompiledShader>();
+            CompiledShader& cs = *it->second;
+            cs.hash = source.hash;
+            cs.pixel = true;
+            cs.info = source.info;
+            cs.info.hlsl = NoKillVariant(source.info.hlsl);
+            if (cs.info.hlsl.empty())
+            {
+                LOG_ONCE("renderer: no alpha-test-free variant for ps %016llx", (unsigned long long)source.hash);
+                cs.state = CompiledShader::Failed;
+            }
+            else
+            {
+                cs.cacheKey = Fnv(cs.info.hlsl.data(), cs.info.hlsl.size(), 3);
+                if (auto bc = g_bytecode.find(cs.cacheKey); bc != g_bytecode.end())
+                {
+                    cs.code = bc->second;
+                    cs.state = CompiledShader::Ready;
+                }
+                else if (LoadCachedBytecode(cs))
+                {
+                    cs.state = CompiledShader::Ready;
+                    g_bytecode.emplace(cs.cacheKey, cs.code);
+                }
+                else
+                    g_compiler.Push(&cs, false);
+            }
+        }
+        base.noKill = it->second.get();
+    }
+    return base.noKill->IsReady() ? base.noKill : nullptr;
+}
+
+// REGPU_FETCH_SPECIALIZE=1 (live; after the FM3 port's regpu-fetch-specialize): a pixel shader's variant with this
+// draw's fetch-constant words baked in as literals. The texture fetch code (TFetch, TFetchRaw, TSign) branches at run
+// time on tinfo[slot].x (sampler, border, one-axis clamp, exponent, sign/gamma, depth-as-colour), the high half of
+// .z (mirroring, lit channels) and .w (dimension, swizzle); with literals the compiler folds every branch the
+// constant rules out. Sizes (.y, low .z) and the descriptor index stay in the constants, so a variant serves every
+// texture of the same kind. Exact: the same values, only known earlier. At most kMaxSpecs variants a shader; a
+// variant not compiled yet, or its pipeline not built yet, draws with the base shader. Not in the pipeline manifest.
+constexpr uint32_t kSpecFlag = 0x02000000; // pipeline key flags: the key's ps is xored with the specialisation
+constexpr uint32_t kMaxSpecs = 64;
+std::string SpecializedVariant(const std::string& hlsl, const uint32_t (*tinfo)[4], uint32_t slots)
+{
+    if (hlsl.find("tinfo[slot].x") == std::string::npos)
+        return {};
+    auto table = [&](const char* name, int word, uint32_t mask) {
+        std::string f = std::string("uint ") + name + "(uint s) { return ";
+        char buf[64];
+        for (uint32_t m = slots; m; m &= m - 1)
+        {
+            const uint32_t slot = uint32_t(__builtin_ctz(m));
+            snprintf(buf, sizeof(buf), "s == %uu ? 0x%08Xu : ", slot, tinfo[slot][word] & mask);
+            f += buf;
+        }
+        return f + "0u; }\n";
+    };
+    std::string h = "// fetch constants of one draw (REGPU_FETCH_SPECIALIZE)\n" + table("TKX", 0, ~0u) + table("TKZ", 2, 0xFFFF0000u) +
+                    table("TKW", 3, ~0u);
+    std::string body = hlsl;
+    auto replaceAll = [&](const std::string& a, const std::string& b) {
+        for (size_t i = body.find(a); i != std::string::npos; i = body.find(a, i + b.size()))
+            body.replace(i, a.size(), b);
+    };
+    replaceAll("tinfo[slot].x", "TKX(slot)");
+    replaceAll("tinfo[slot].w", "TKW(slot)");
+    replaceAll("(tinfo[slot].z >> ", "(TKZ(slot) >> ");
+    // A literal swizzle selector of 4 or 5 (zero, one) would index v out of bounds on the unused side of the ?: (fxc X3504).
+    replaceAll("v[sel]", "v[sel & 3u]");
+    // After "#define GUEST_PIXEL 1" (the first line of a pixel shader), before the preamble.
+    const size_t firstLine = body.rfind("#define GUEST_PIXEL", 0) == 0 ? body.find('\n') + 1 : 0;
+    body.insert(firstLine, h);
+    return body;
+}
+
+struct SpecShaders
+{
+    std::unordered_map<uint64_t, std::unique_ptr<CompiledShader>> byKey; // (base cacheKey, specialisation) -> variant
+    std::unordered_map<uint64_t, uint32_t> perBase;                      // variants made per base shader
+};
+SpecShaders g_specShaders;
+uint64_t SpecHash(const uint32_t (*tinfo)[4], uint32_t slots)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (uint32_t m = slots; m; m &= m - 1)
+    {
+        const uint32_t slot = uint32_t(__builtin_ctz(m));
+        for (const uint32_t v : { slot, tinfo[slot][0], tinfo[slot][2] & 0xFFFF0000u, tinfo[slot][3] })
+            h = (h ^ v) * 0x100000001B3ull;
+    }
+    return h | 1; // never 0
+}
+// The ready variant of `base` for these fetch constants, or nullptr (compiling, over the limit, or not made).
+const CompiledShader* SpecializedShader(const CompiledShader& base, const uint32_t (*tinfo)[4], uint32_t slots, uint64_t spec)
+{
+    const uint64_t key = (base.cacheKey * 0x9E3779B97F4A7C15ull) ^ spec;
+    thread_local std::unordered_map<uint64_t, const CompiledShader*> seen; // (variants are never removed)
+    if (auto it = seen.find(key); it != seen.end())
+        return it->second && it->second->IsReady() ? it->second : nullptr;
+    std::lock_guard lock(g_shaderMutex);
+    auto it = g_specShaders.byKey.find(key);
+    if (it == g_specShaders.byKey.end())
+    {
+        uint32_t& count = g_specShaders.perBase[base.cacheKey];
+        if (count >= kMaxSpecs)
+        {
+            seen.emplace(key, nullptr);
+            return nullptr;
+        }
+        count++;
+        auto cs = std::make_unique<CompiledShader>();
+        cs->hash = base.hash;
+        cs->pixel = true;
+        cs->info = base.info;
+        const CompiledShader& source = base.hlslSource ? *base.hlslSource : base;
+        cs->info.hlsl = SpecializedVariant(source.info.hlsl, tinfo, slots);
+        if (cs->info.hlsl.empty())
+            cs->state = CompiledShader::Failed;
+        else
+        {
+            cs->cacheKey = Fnv(cs->info.hlsl.data(), cs->info.hlsl.size(), 4);
+            if (auto bc = g_bytecode.find(cs->cacheKey); bc != g_bytecode.end())
+            {
+                cs->code = bc->second;
+                cs->state = CompiledShader::Ready;
+            }
+            else if (LoadCachedBytecode(*cs))
+            {
+                cs->state = CompiledShader::Ready;
+                g_bytecode.emplace(cs->cacheKey, cs->code);
+            }
+            else
+                g_compiler.Push(cs.get(), false);
+        }
+        it = g_specShaders.byKey.emplace(key, std::move(cs)).first;
+    }
+    const CompiledShader* v = it->second.get();
+    if (v->state.load(std::memory_order_acquire) == CompiledShader::Failed)
+        v = nullptr;
+    if (!v || v->IsReady())
+        seen.emplace(key, v); // final answers only: a pending one is looked up again
+    return v && v->IsReady() ? v : nullptr;
 }
 
 D3D12_BLEND Blend(uint32_t f)
@@ -3506,7 +3767,8 @@ std::shared_ptr<PipelineEntry> EnsurePipeline(const CompiledShader& vs, const Co
     }
     auto entry = std::make_shared<PipelineEntry>();
     g_r.pipelines[key] = entry;
-    if (!motion && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs)) // the manifest rebuilds pipelines from the base shaders (not live edits)
+    // The manifest rebuilds pipelines from the base shaders (not live edits or the alpha-test-free variant).
+    if (!motion && !(key.flags & (kNoKillFlag | kSpecFlag)) && !IsPsEditAlias(key.ps) && !IsPsEditAlias(key.vs))
     {
         g_manifest.RecordShader(false, key.vs, vs.ucodeBE);
         g_manifest.RecordShader(true, key.ps, ps.ucodeBE);
@@ -3596,11 +3858,19 @@ bool GameSettled()
     return g_lastLongHold.time_since_epoch().count() != 0 && std::chrono::steady_clock::now() - g_lastLongHold > std::chrono::seconds(4);
 }
 
-ID3D12PipelineState* GetPipelineImpl(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion)
+ID3D12PipelineState* GetPipelineImpl(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion, bool noKill,
+    uint64_t spec)
 {
     PipelineKey key = MakePipelineKey(C().vsHash, C().psHash, depthOnly, cullable);
     if (motion)
         key.flags |= 4;
+    if (noKill)
+        key.flags |= kNoKillFlag;
+    if (spec)
+    {
+        key.flags |= kSpecFlag;
+        key.ps ^= spec;
+    }
     thread_local std::unordered_map<PipelineKey, ID3D12PipelineState*, PipelineKeyHash> ready; // (pipelines are never removed)
     // Runs of draws share a pipeline: the last one's answer first, before the map.
     thread_local PipelineKey lastKey{};
@@ -3628,6 +3898,9 @@ ID3D12PipelineState* GetPipelineImpl(const CompiledShader& vs, const CompiledSha
         }
         entry = EnsurePipeline(vs, ps, key);
     }
+    // The alpha-test-free variant is optional: until its pipeline is built (in the background) the draw uses the base one.
+    if ((noKill || spec) && entry->state.load(std::memory_order_acquire) != 1)
+        return nullptr;
     // Every draw waits for its pipeline: a draw is never dropped because it is still building.
     // REGPU_SKIP_BUILDING_DRAWS=1 (test, live): once the game runs (GameSettled), a draw whose pipeline is
     // still building is skipped instead (a first-time pipeline in a race froze the frame for up to ~2 s).
@@ -3646,7 +3919,8 @@ ID3D12PipelineState* GetPipelineImpl(const CompiledShader& vs, const CompiledSha
 
 // GetPipeline with a long-wait report: a draw that waits over 250 ms for its pipeline is logged with its shaders, and a
 // watchdog logs a wait still going after a second (so it is in the log even if the game then hangs or the device is lost).
-ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false)
+ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader& ps, bool depthOnly, bool cullable, bool motion = false, bool noKill = false,
+    uint64_t spec = 0)
 {
     static std::once_flag watchdogStarted;
     std::call_once(watchdogStarted, [] {
@@ -3697,7 +3971,7 @@ ID3D12PipelineState* GetPipeline(const CompiledShader& vs, const CompiledShader&
     g_pipelineWaitVs.store(C().vsHash, std::memory_order_relaxed);
     g_pipelineWaitPs.store(C().psHash, std::memory_order_relaxed);
     g_pipelineWaitStartNs.store(start.time_since_epoch().count(), std::memory_order_relaxed);
-    ID3D12PipelineState* pso = GetPipelineImpl(vs, ps, depthOnly, cullable, motion);
+    ID3D12PipelineState* pso = GetPipelineImpl(vs, ps, depthOnly, cullable, motion, noKill, spec);
     g_pipelineWaitStartNs.store(0, std::memory_order_relaxed);
     if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); ms > 250.0)
         Log("perf: a draw spent %.0f ms getting pipeline %016llx/%016llx (%s, %s)", ms, (unsigned long long)C().vsHash, (unsigned long long)C().psHash,
@@ -7562,7 +7836,11 @@ struct DeferredWriteback
     std::atomic<uint64_t> state{ 0 };
 };
 // A deque: entries keep their address while the fence writer thread may hold them.
-std::deque<DeferredWriteback> g_deferredWritebacks[kFrames];
+// Two sets per frame slot, used in turn: a slot's write-back job (FinishDeferredWritebacks) keeps the set it writes
+// until the slot comes round again, while the frame records into the other.
+std::deque<DeferredWriteback> g_deferredWritebacksBuf[kFrames][2];
+uint8_t g_deferredParity[kFrames] = {};
+std::deque<DeferredWriteback>& DeferredSlot(UINT s) { return g_deferredWritebacksBuf[s][g_deferredParity[s]]; }
 size_t g_deferredUsed[kFrames] = {};
 size_t g_deferredFenced[kFrames] = {}; // entries already handed to the fence writer
 // Base -> hash of the guest memory after our last write-back there (ClaimAndWrite).
@@ -7612,7 +7890,9 @@ bool ClaimAndWrite(DeferredWriteback& w, uint64_t generation)
     static LiveSwitch overwrite("REGPU_WRITEBACK_OVERWRITE");
     // (Our own earlier write-back of the same image landing in between is not the title's: the memory
     // then holds what we last wrote there.)
-    const uint64_t now = w.memBytes ? ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(w.base)), w.memBytes, 4) : 0;
+    // (FullHash: every byte, four lanes at a time; a dword-by-dword chain over the whole image here, at recording and
+    // after writing, held up the command processor and the write-back job.)
+    const uint64_t now = w.memBytes ? FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(w.base)), w.memBytes) : 0;
     bool ours = false;
     {
         std::lock_guard lock(g_ownWriteMutex);
@@ -7634,8 +7914,9 @@ bool ClaimAndWrite(DeferredWriteback& w, uint64_t generation)
         WriteResolvePixels(pixels, w.pitch, w.hostFormat, w.hostW, w.hostH, w.base, w.width, w.info, w.depth, w.x0, w.x1, w.y0, w.y1);
         if (w.memBytes)
         {
+            const uint64_t written = FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(w.base)), w.memBytes);
             std::lock_guard lock(g_ownWriteMutex);
-            g_ownWrite[w.base] = ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(w.base)), w.memBytes, 4);
+            g_ownWrite[w.base] = written;
         }
         const D3D12_RANGE none{ 0, 0 };
         w.buffer->Unmap(0, &none);
@@ -7690,14 +7971,21 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
         first = std::min<UINT>(UINT(uint64_t(i) * host / n), host - 1);
         last = std::clamp<UINT>(UINT(uint64_t(i + 1) * host / n), first + 1, host);
     };
-    for (uint32_t y = y0; y < y1; y++)
+    // Each column's texel span once (not per row), and big images in row bands on helper threads: rows write
+    // disjoint bytes, and every pixel is computed exactly as before.
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    std::vector<UINT> columns(size_t(x1 - x0) * 2);
+    for (uint32_t x = x0; x < x1; x++)
+        span(x - x0, x1 - x0, hostW, columns[size_t(x - x0) * 2], columns[size_t(x - x0) * 2 + 1]);
+    const auto rows = [&](uint32_t ya, uint32_t yb) {
+    for (uint32_t y = ya; y < yb; y++)
     {
         UINT hy0, hy1;
         span(y - y0, y1 - y0, hostH, hy0, hy1);
         for (uint32_t x = x0; x < x1; x++)
         {
-            UINT hx0, hx1;
-            span(x - x0, x1 - x0, hostW, hx0, hx1);
+            const UINT hx0 = columns[size_t(x - x0) * 2], hx1 = columns[size_t(x - x0) * 2 + 1];
             uint32_t words[4] = {};
             if (depth)
                 words[0] = EncodeDepth20e4(*reinterpret_cast<const float*>(pixels + size_t(hy0) * pitch + size_t(hx0) * 4)) << 8;
@@ -7739,9 +8027,167 @@ void WriteResolvePixels(const uint8_t* pixels, UINT pitch, DXGI_FORMAT hostForma
                 guest[resolve::SwappedByte(at + k, endian)] = b[k];
         }
     }
+    };
+    // Bands of 32 rows or more (every pixel has its own guest bytes), when there are over 128K host texels to read.
+    const uint32_t bands = uint64_t(hostW) * hostH >= (1u << 17) ? std::min<uint32_t>(4, (y1 - y0 + 31) / 32) : 1;
+    if (bands <= 1)
+    {
+        rows(y0, y1);
+        return;
+    }
+    const uint32_t step = (((y1 - y0 + bands - 1) / bands) + 31) & ~31u;
+    std::vector<std::thread> helpers;
+    for (uint32_t ya = y0 + step; ya < y1; ya += step)
+        helpers.emplace_back([&, ya] { rows(ya, std::min(y1, ya + step)); });
+    rows(y0, std::min(y1, y0 + step));
+    for (std::thread& t : helpers)
+        t.join();
 }
 
+// A frame slot's deferred write-backs, written off the command processor (REGPU_SYNC_WRITEBACKS=1, live: on it, as
+// before). Converting and tiling the pixels took ~16% of FM4's command processor (the road image, every frame). The
+// job writes the entries grouped by destination, groups in parallel and each group in order (ClaimAndWrite compares
+// the memory with what the last write left there), then hashes each written image for NoteResolvedMemory. The slot's
+// entries are reused only after JoinWritebackJob: QueueDeferredWriteback and the next FinishDeferredWritebacks wait for it.
+struct WritebackNote
+{
+    uint32_t base = 0, width = 0, height = 0, bpp = 0;
+    uint64_t hash = 0;
+};
+struct WritebackJob
+{
+    std::thread thread;
+    std::vector<WritebackNote> notes;
+    std::atomic<bool> done{ false };
+    ~WritebackJob()
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+};
+WritebackJob g_writebackJobs[kFrames];
+// Jobs write in the order they were started (two can write the same image): each waits for the one before.
+std::mutex g_writebackOrderMutex;
+std::condition_variable g_writebackOrderCv;
+uint64_t g_writebackJobsStarted = 0, g_writebackJobsDone = 0;
+
+// Applies a finished job's results (NoteResolvedMemory's hashes). wait: wait for it if it is still running.
+void JoinWritebackJob(UINT frameIndex, bool wait = true)
+{
+    WritebackJob& job = g_writebackJobs[frameIndex];
+    if (!job.thread.joinable() || (!wait && !job.done.load(std::memory_order_acquire)))
+        return;
+    job.thread.join();
+    for (const WritebackNote& n : job.notes)
+        if (auto it = g_r.resolved.find(n.base); it != g_r.resolved.end())
+        {
+            ResolvedTexture& r = it->second;
+            if (r.width == n.width && r.height == n.height && r.guestBpp == n.bpp)
+            {
+                r.memHash = n.hash;
+                r.memChecked = g_r.frame;
+                r.stale = false;
+                r.ownWrite = true;
+            }
+            else
+                NoteResolvedMemory(n.base, r, true);
+        }
+    job.notes.clear();
+}
+
+void FinishDeferredWritebacksSync(UINT frameIndex);
 void FinishDeferredWritebacks(UINT frameIndex)
+{
+    for (UINT s = 0; s < kFrames; s++)
+        JoinWritebackJob(s, s == frameIndex); // this slot's job must be done (its set is about to be reused)
+    static LiveSwitch sync("REGPU_SYNC_WRITEBACKS");
+    if (sync || g_deferredUsed[frameIndex] < 2)
+    {
+        if (g_deferredUsed[frameIndex])
+        {
+            // After any job still writing (it may write the same image, earlier).
+            std::unique_lock lock(g_writebackOrderMutex);
+            g_writebackOrderCv.wait(lock, [] { return g_writebackJobsDone == g_writebackJobsStarted; });
+        }
+        FinishDeferredWritebacksSync(frameIndex);
+        return;
+    }
+    {
+        std::lock_guard lock(g_fencedMutex);
+        std::erase_if(g_fenced, [&](const FencedWriteback& f) { return f.slot == frameIndex; });
+    }
+    g_deferredFenced[frameIndex] = 0;
+    const size_t used = g_deferredUsed[frameIndex];
+    WritebackJob& job = g_writebackJobs[frameIndex];
+    std::deque<DeferredWriteback>* entries = &DeferredSlot(frameIndex);
+    std::vector<std::vector<size_t>> groups;
+    {
+        std::unordered_map<uint32_t, size_t> byBase;
+        for (size_t i = 0; i < used; i++)
+        {
+            const uint32_t base = (*entries)[i].base;
+            auto [it, inserted] = byBase.try_emplace(base, groups.size());
+            if (inserted)
+            {
+                groups.emplace_back();
+                WritebackNote n{ base };
+                if (auto r = g_r.resolved.find(base); r != g_r.resolved.end())
+                {
+                    n.width = r->second.width;
+                    n.height = r->second.height;
+                    n.bpp = r->second.guestBpp;
+                    r->second.memChecked = g_r.frame; // (no stale check of it until the job is joined)
+                    job.notes.push_back(n);
+                }
+            }
+            groups[it->second].push_back(i);
+        }
+    }
+    g_deferredUsed[frameIndex] = 0;
+    g_deferredParity[frameIndex] ^= 1; // the frame records into the other set; the job keeps this one
+    job.done = false;
+    const uint64_t order = ++g_writebackJobsStarted;
+    job.thread = std::thread([entries, order, groups = std::move(groups), notes = &job.notes, done = &job.done]() {
+        {
+            std::unique_lock lock(g_writebackOrderMutex);
+            g_writebackOrderCv.wait(lock, [&] { return g_writebackJobsDone == order - 1; });
+        }
+        auto writeGroup = [&](const std::vector<size_t>& g) {
+            for (const size_t i : g)
+            {
+                DeferredWriteback& w = (*entries)[i];
+                const uint64_t generation = w.state.load() >> 2;
+                if (!ClaimAndWrite(w, generation))
+                    while ((w.state.load() & 3) == 1)
+                        std::this_thread::yield();
+            }
+        };
+        if (groups.size() == 1)
+            writeGroup(groups[0]);
+        else
+        {
+            std::vector<std::thread> helpers;
+            std::atomic<size_t> next{ 0 };
+            const size_t n = std::min<size_t>(groups.size(), 4);
+            for (size_t t = 1; t < n; t++)
+                helpers.emplace_back([&] { for (size_t k; (k = next++) < groups.size();) writeGroup(groups[k]); });
+            for (size_t k; (k = next++) < groups.size();)
+                writeGroup(groups[k]);
+            for (std::thread& h : helpers)
+                h.join();
+        }
+        for (WritebackNote& n : *notes)
+            n.hash = GuestImageHash(n.base, n.width, n.height, n.bpp);
+        {
+            std::lock_guard lock(g_writebackOrderMutex);
+            g_writebackJobsDone = order;
+        }
+        g_writebackOrderCv.notify_all();
+        done->store(true, std::memory_order_release);
+    });
+}
+
+void FinishDeferredWritebacksSync(UINT frameIndex)
 {
     {
         // This slot's entries leave the fence writer's list: they are finished here.
@@ -7751,7 +8197,7 @@ void FinishDeferredWritebacks(UINT frameIndex)
     g_deferredFenced[frameIndex] = 0;
     for (size_t i = 0; i < g_deferredUsed[frameIndex]; i++)
     {
-        DeferredWriteback& w = g_deferredWritebacks[frameIndex][i];
+        DeferredWriteback& w = DeferredSlot(frameIndex)[i];
         // Written by the fence writer already (or being written: wait for it), else written here.
         const uint64_t generation = w.state.load() >> 2;
         if (!ClaimAndWrite(w, generation))
@@ -7767,6 +8213,7 @@ void FinishDeferredWritebacks(UINT frameIndex)
 void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint32_t info, bool depth, const D3D12_RECT& rect,
     const regpu::Writeback& request)
 {
+    JoinWritebackJob(g_r.frameIndex, false); // (a finished job's results, without waiting: its set isn't this one)
     const auto it = g_r.resolved.find(base);
     if (it == g_r.resolved.end() || !it->second.resource ||
         (depth ? it->second.format != DXGI_FORMAT_R32_FLOAT
@@ -7778,7 +8225,7 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     if (x1 <= x0 || y1 <= y0)
         return;
     ResolvedTexture& r = it->second;
-    auto& slot = g_deferredWritebacks[g_r.frameIndex];
+    auto& slot = DeferredSlot(g_r.frameIndex);
     if (g_deferredUsed[g_r.frameIndex] == slot.size())
         slot.emplace_back();
     DeferredWriteback& w = slot[g_deferredUsed[g_r.frameIndex]++];
@@ -7814,7 +8261,7 @@ void QueueDeferredWriteback(uint32_t base, uint32_t width, uint32_t height, uint
     w.depth = depth;
     w.x0 = x0, w.x1 = x1, w.y0 = y0, w.y1 = y1;
     w.memBytes = WritebackRange(w);
-    w.memHash = w.memBytes ? ContentHash(GuestPtr<uint8_t>(GpuPhysToGuest(base)), w.memBytes, 4) : 0;
+    w.memHash = w.memBytes ? FullHash(GuestPtr<uint8_t>(GpuPhysToGuest(base)), w.memBytes) : 0; // (as ClaimAndWrite)
     {
         std::lock_guard lock(g_ownWriteMutex);
         const auto own = g_ownWrite.find(base);
@@ -7857,11 +8304,11 @@ uint64_t FenceSubmitImpl()
             return 0;
         bool hold = allWritebacks;
         for (size_t i = g_deferredFenced[slot]; i < g_deferredUsed[slot] && !hold; i++)
-            if (g_deferredWritebacks[slot][i].first)
+            if (DeferredSlot(slot)[i].first)
             {
                 hold = true;
                 static uint32_t logged = 0;
-                const DeferredWriteback& w = g_deferredWritebacks[slot][i];
+                const DeferredWriteback& w = DeferredSlot(slot)[i];
                 if (logged++ < 100)
                     Log("renderer: fence held for the write-back of %08X (%ux%u): its memory doesn't hold our last image of it (frame %llu)", w.base,
                         w.width, w.height, (unsigned long long)g_r.frame);
@@ -7881,7 +8328,7 @@ uint64_t FenceSubmitImpl()
                 std::lock_guard lock(g_fencedMutex);
                 for (size_t i = g_deferredFenced[slot]; i < g_deferredUsed[slot]; i++)
                 {
-                    DeferredWriteback& w = g_deferredWritebacks[slot][i];
+                    DeferredWriteback& w = DeferredSlot(slot)[i];
                     g_fenced.push_back({ &w, value, w.state.load() >> 2, slot });
                 }
                 g_deferredFenced[slot] = g_deferredUsed[slot];
@@ -7909,7 +8356,7 @@ uint64_t FenceSubmitImpl()
         std::lock_guard lock(g_fencedMutex);
         for (size_t i = g_deferredFenced[slot]; i < g_deferredUsed[slot]; i++)
         {
-            DeferredWriteback& w = g_deferredWritebacks[slot][i];
+            DeferredWriteback& w = DeferredSlot(slot)[i];
             g_fenced.push_back({ &w, lastValue, w.state.load() >> 2, slot });
         }
         g_deferredFenced[slot] = g_deferredUsed[slot];
@@ -8753,12 +9200,31 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_tstat.shaderNotReady++;
     D3D12_GPU_VIRTUAL_ADDRESS motionPrevious = 0; // last frame's vertex constants of this draw (b2)
     ID3D12PipelineState* pso = motion ? GetPipeline(*mvs, *mps, false, cullable, true) : nullptr;
+    const CompiledShader* psPipeline = &ps; // the pixel shader of a plain pipeline (ps or its alpha-test-free variant)
+    bool psNoKill = false;
     if (wantMotion && motion && !pso)
         g_tstat.noPipeline++;
     if (!pso)
     {
         motion = false;
-        pso = GetPipeline(vs, ps, edramMode == 5, cullable);
+        // REGPU_SPLIT_ALPHA_TEST (NoKillShader): no alpha test this draw (the function is "always", or a depth-only
+        // pass, as pinfo.x is set below): the pixel shader's variant without the alpha-test kill.
+        static LiveSwitch splitAlphaTest("REGPU_SPLIT_ALPHA_TEST");
+        if (splitAlphaTest && !IsPsEditAlias(C().psHash))
+        {
+            const uint32_t cc = gpureg::Get(RB_COLORCONTROL);
+            static LiveSwitch depthAlphaTestK("REGPU_DEPTH_ALPHATEST");
+            const bool alphaTest = ((cc >> 3) & 1) && (edramMode != 5 || depthAlphaTestK) && (cc & 7) != 7;
+            if (!alphaTest) // (pinfo.x is then 7: the variant is exact, alpha-to-mask included)
+                if (const CompiledShader* k = NoKillShader(ps))
+                    if ((pso = GetPipeline(vs, *k, edramMode == 5, cullable, false, true)))
+                    {
+                        psPipeline = k;
+                        psNoKill = true;
+                    }
+        }
+        if (!pso)
+            pso = GetPipeline(vs, ps, edramMode == 5, cullable);
     }
     {
         DrawRecord& d = g_drawRing[g_drawRingNext.fetch_add(1, std::memory_order_relaxed) % kDrawRing];
@@ -9196,6 +9662,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         g_bindingsFrame = g_r.frame;
         g_bindingsEpoch = g_resolveEpoch;
     }
+    // The slots' fetch words in ordinary memory too (pc is the upload heap, write-combined: reading it back is slow),
+    // for REGPU_FETCH_SPECIALIZE below.
+    uint32_t slotInfo[32][4];
+    float slotBias[32][4];
     for (uint32_t m = usedSlots; m; m &= m - 1)
     {
         const uint32_t slot = uint32_t(__builtin_ctz(m));
@@ -9209,10 +9679,14 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         {
             memcpy(pc->tinfo[slot], memo.tinfo, sizeof(memo.tinfo));
             memcpy(pc->tbias[slot], memo.tbias, sizeof(memo.tbias));
+            memcpy(slotInfo[slot], memo.tinfo, sizeof(memo.tinfo));
             g_drawSamplesResolve |= memo.samplesResolve;
             continue;
         }
         const bool samplesBefore = g_drawSamplesResolve;
+        // Built here, then copied to pc once: its |= on the write-combined upload heap read it back.
+        memset(slotInfo[slot], 0, sizeof(slotInfo[slot]));
+        memset(slotBias[slot], 0, sizeof(slotBias[slot]));
         g_drawSamplesResolve = false;
         const bool cube = fetch.Dimension() == 3;
         const bool volume = fetch.Dimension() == 2;
@@ -9256,7 +9730,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 if (sel == 0 || sel == 2)
                     swizzle ^= (sel ^ (2 - sel)) << (3 * c);
             }
-        pc->tinfo[slot][3] = (cube ? 3 : volume ? 2 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
+        slotInfo[slot][3] = (cube ? 3 : volume ? 2 : 1) | (onGpu ? (1u << 31) | (swizzle << 8) : 0);
         // Clamp X and Y (dword 0 bits 10-12, 13-15): 0 wrap, 1 mirrored repeat, 2 and up clamp, the odd
         // ones (3, 5, 7) mirrored once first. Filter: dword 3 bits 19-20 (mag): 0 point. With only one
         // axis clamped (kerbs: clamped across, repeating along) the wrapping sampler is used and the
@@ -9268,13 +9742,13 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         static LiveSwitch oldClamp("REGPU_OLD_CLAMP"); // A/B: X's mode for both axes (before the kerb fix)
         const bool clamp = oldClamp ? clampX != 0 : clampX != 0 && clampY != 0;
         const bool point = ((fetch.dwords[3] >> 19) & 3) == 0;
-        pc->tinfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
+        slotInfo[slot][0] = (point ? (clamp ? 2 : 3) : (clamp ? 1 : 0)) | ((uint32_t(fetch.ExpAdjust()) & 0x3F) << 8);
         if (!clamp && !oldClamp)
-            pc->tinfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
+            slotInfo[slot][0] |= (clampX ? 1u << 18 : 0u) | (clampY ? 1u << 19 : 0u);
         // Clamp to border on both axes (modes 6, 7): the shader returns the border colour
         // outside the image (dword 5 bits 0-1: 1 white, else black).
         if (clampX >= 6 && clampY >= 6)
-            pc->tinfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
+            slotInfo[slot][0] |= (1u << 16) | ((fetch.dwords[5] & 3) == 1 ? 1u << 17 : 0u);
         // Sign modes (dword 0 bits 2-9, per texture component: gamma, biased; see TSign), in
         // bits 20-27. The shader applies them before the fetch swizzle, so a texture swizzled
         // on the CPU gets them moved to where its components went. REGPU_NO_TEXTURE_SIGN=1
@@ -9290,26 +9764,26 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                     if (const uint32_t sel = (fetch.Swizzle() >> (3 * c)) & 7; sel < 4)
                         applied |= ((signs >> (2 * sel)) & 3) << (2 * c);
             }
-            pc->tinfo[slot][0] |= applied << 20;
+            slotInfo[slot][0] |= applied << 20;
         }
         // Below output resolution the upscaler wants sharper mips (log2 of the scale, e.g. -0.58 at 67%).
         static LiveSwitch noLodBias("REGPU_NO_LOD_BIAS");
-        pc->tbias[slot][0] = fetch.LodBias() + (g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f);
-        memcpy(&pc->tbias[slot][1], &index, 4);
+        slotBias[slot][0] = fetch.LodBias() + (g_sceneScale < 1.0f && !noLodBias ? std::log2(g_sceneScale) : 0.0f);
+        memcpy(&slotBias[slot][1], &index, 4);
         // A resolved texture is as wide as the pitch it was resolved with; the fetch
         // constant may declare a narrower image inside it (e.g. 163 of 192 columns):
         // the shader scales UVs so 0..1 spans the declared image, not the padding.
-        pc->tbias[slot][2] = pc->tbias[slot][3] = 1.0f;
+        slotBias[slot][2] = slotBias[slot][3] = 1.0f;
         if (onGpu && resolvedPtr && !cube && resolvedPtr->width && resolvedPtr->height && resolvedPtr->resource)
         {
-            pc->tbias[slot][2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
-            pc->tbias[slot][3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
+            slotBias[slot][2] = std::min(1.0f, float(fetch.Width()) / float(resolvedPtr->width));
+            slotBias[slot][3] = std::min(1.0f, float(fetch.Height()) / float(resolvedPtr->height));
         }
-        pc->tinfo[slot][1] = fetch.Width() | (volume ? fetch.Depth() << 16 : 0); // 3D: the depth in bits 16-31
-        pc->tinfo[slot][2] = fetch.Height();
+        slotInfo[slot][1] = fetch.Width() | (volume ? fetch.Depth() << 16 : 0); // 3D: the depth in bits 16-31
+        slotInfo[slot][2] = fetch.Height();
         static LiveSwitch noMirror("REGPU_NO_TEXTURE_MIRROR");
         if (!oldClamp && !noMirror)
-            pc->tinfo[slot][2] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
+            slotInfo[slot][2] |= (clampX == 1 ? 1u << 20 : 0u) | (clampY == 1 ? 1u << 21 : 0u) | (clampX >= 3 && (clampX & 1) ? 1u << 22 : 0u) |
                 (clampY >= 3 && (clampY & 1) ? 1u << 23 : 0u);
         {
             // Soft-shadow cascade tests. A depth copy read as an 8-bit colour texture gets the
@@ -9332,23 +9806,46 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
                 return m;
             }();
             if (depthAs8888 && onGpu && resolvedPtr && resolvedPtr->format == DXGI_FORMAT_R32_FLOAT && fetch.Format() == 6)
-                pc->tinfo[slot][0] |= (1u << 28) | (depthRgb ? 1u << 29 : 0u) | (depthRev ? 1u << 30 : 0u) | (depthFloat ? 1u << 31 : 0u);
-            if (depthAs8888 && depthStencil && (pc->tinfo[slot][0] >> 28 & 1))
-                pc->tinfo[slot][2] |= 1u << 19;
+                slotInfo[slot][0] |= (1u << 28) | (depthRgb ? 1u << 29 : 0u) | (depthRev ? 1u << 30 : 0u) | (depthFloat ? 1u << 31 : 0u);
+            if (depthAs8888 && depthStencil && (slotInfo[slot][0] >> 28 & 1))
+                slotInfo[slot][2] |= 1u << 19;
             if ((cascadeSlots >> slot) & 1)
-                pc->tinfo[slot][2] |= ((litR ? 1u : 0u) | (litG ? 2u : 0u) | (litB ? 4u : 0u)) << 16;
+                slotInfo[slot][2] |= ((litR ? 1u : 0u) | (litG ? 2u : 0u) | (litB ? 4u : 0u)) << 16;
         }
         memcpy(memo.fetch, fetch.dwords, sizeof(memo.fetch));
         memo.frame = g_r.frame;
         memo.epoch = g_resolveEpoch;
-        memcpy(memo.tinfo, pc->tinfo[slot], sizeof(memo.tinfo));
-        memcpy(memo.tbias, pc->tbias[slot], sizeof(memo.tbias));
+        memcpy(pc->tinfo[slot], slotInfo[slot], sizeof(slotInfo[slot]));
+        memcpy(pc->tbias[slot], slotBias[slot], sizeof(slotBias[slot]));
+        memcpy(memo.tinfo, slotInfo[slot], sizeof(memo.tinfo));
+        memcpy(memo.tbias, slotBias[slot], sizeof(memo.tbias));
         memo.samplesResolve = g_drawSamplesResolve;
         g_drawSamplesResolve |= samplesBefore;
     }
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
+    // REGPU_FETCH_SPECIALIZE (SpecializedShader): the pixel shader with this draw's fetch constants as literals.
+    if (static LiveSwitch fetchSpecialize("REGPU_FETCH_SPECIALIZE"); fetchSpecialize && !motion && ps.info.usedTextureSlots && !IsPsEditAlias(C().psHash))
+    {
+        const uint32_t slots = ps.info.usedTextureSlots;
+        const uint64_t spec = SpecHash(slotInfo, slots);
+        // Per thread, (base pipeline, specialisation) -> specialised pipeline, direct-mapped: a repeated draw costs one
+        // probe instead of the variant lookup and a second pipeline lookup (the command processor is the next limit).
+        struct SpecMemo { uint64_t key; ID3D12PipelineState* pso; };
+        constexpr uint32_t kSpecMemo = 4096;
+        thread_local std::unique_ptr<SpecMemo[]> memo(new SpecMemo[kSpecMemo]());
+        const uint64_t mk = (uint64_t(uintptr_t(pso)) * 0x9E3779B97F4A7C15ull) ^ spec;
+        SpecMemo& m = memo[(mk ^ (mk >> 31)) & (kSpecMemo - 1)];
+        if (m.key == mk && m.pso)
+            pso = m.pso;
+        else if (const CompiledShader* k = SpecializedShader(*psPipeline, slotInfo, slots, spec))
+            if (ID3D12PipelineState* sp = GetPipeline(vs, *k, edramMode == 5, cullable, false, psNoKill, spec))
+            {
+                m = { mk, sp };
+                pso = sp;
+            }
+    }
 
     Section(5);
     // Viewport. The viewport transform happens in the vertex shader; D3D maps 1:1.
@@ -9672,6 +10169,23 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         }
         const auto issue = [&] {
             const UINT vertices = indexedCount ? indexedCount : directIndex ? directVertices : UINT(list.size());
+            // Measurement only (live; the picture is wrong): REGPU_EXP_ONE_TRIANGLE=1 draws the first triangle of each
+            // draw (what a draw costs apart from its vertices and pixels), REGPU_EXP_TINY_SCISSOR=1 clips each draw to
+            // one pixel (its vertex work and fixed cost, no pixels). The scissor is restored by the next change.
+            static LiveSwitch oneTriangle("REGPU_EXP_ONE_TRIANGLE"), tinyScissor("REGPU_EXP_TINY_SCISSOR");
+            if (tinyScissor)
+            {
+                const D3D12_RECT one{ 0, 0, 1, 1 };
+                C().list->RSSetScissorRects(1, &one);
+            }
+            if (oneTriangle)
+            {
+                if (indexedCount)
+                    C().list->DrawIndexedInstanced(std::min<UINT>(indexedCount, 3), 1, 0, 0, 0);
+                else
+                    C().list->DrawInstanced(std::min<UINT>(vertices, 3), 1, 0, 0);
+                return;
+            }
             if (indexedCount)
                 C().list->DrawIndexedInstanced(indexedCount, 1, 0, 0, 0);
             else
@@ -10686,6 +11200,7 @@ uint64_t RendererEditPixelShader(uint64_t hash, const std::string& expr)
         g_psEditAlias[hash] = alias;
         g_psEditExpr[alias] = expr;
         g_psEditEver.insert(alias);
+        g_psEditEverAny.store(true, std::memory_order_release);
     }
     g_psEdits = !g_psEditAlias.empty();
     return alias;

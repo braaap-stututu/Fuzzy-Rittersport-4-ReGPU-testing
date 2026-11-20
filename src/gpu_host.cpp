@@ -92,6 +92,20 @@ void GpuStart()
     // copy landing a frame late is harmless: fences are not held. FM4_WRITEBACK_FENCES=1 holds them (A/B).
     if (!getenv("FM4_WRITEBACK_FENCES") && !getenv("REGPU_NO_WRITEBACK_FENCES"))
         _putenv_s("REGPU_NO_WRITEBACK_FENCES", "1");
+    // Pixel shaders without the run-time alpha test where a draw has none (early depth works again), and with each
+    // draw's texture fetch constants baked in (the fetch code's branches fold): frozen race grid at 1440p 4x on an
+    // RX 7900 XTX ~107 -> ~119.5 fps (+12%; +3% and +9% apart), picture identical within 1/255 on 34 pixels.
+    // FM4_NO_SHADER_VARIANTS=1: neither (both are also live switches: REGPU_SPLIT_ALPHA_TEST, REGPU_FETCH_SPECIALIZE).
+    // The per-draw upload ring (constants, vertex data, index lists) in VRAM through resizable BAR: the GPU stopped waiting
+    // on system memory for every draw (about 1.5 us of fixed GPU time a draw before). Frozen grid, RX 7900 XTX: 1440p 4x
+    // 119.7 -> 152.2 fps (+27%), 720p 1x +6.7%, picture identical. Only where the driver reports GPU upload heaps
+    // (resizable BAR / Smart Access Memory on); elsewhere the ring stays in system memory. FM4_SYSTEM_MEMORY_RING=1: off.
+    if (!getenv("FM4_SYSTEM_MEMORY_RING") && !getenv("REGPU_GPU_UPLOAD_RING"))
+        _putenv_s("REGPU_GPU_UPLOAD_RING", "1");
+    if (!getenv("FM4_NO_SHADER_VARIANTS"))
+        for (const char* name : { "REGPU_SPLIT_ALPHA_TEST", "REGPU_FETCH_SPECIALIZE" })
+            if (!getenv(name))
+                _putenv_s(name, "1");
     host.resolveWriteback = [](const regpu::ResolveCopy& c) {
         regpu::Writeback w;
         static LiveSwitch off("FM4_NO_ROAD_WRITEBACK"); // live

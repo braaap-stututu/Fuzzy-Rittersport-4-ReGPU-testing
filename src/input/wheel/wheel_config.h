@@ -81,6 +81,11 @@ struct Config
                 out = std::clamp(std::atoi(v.c_str()), lo, hi);
         };
         lower("wheel_mode", c.mode, { "auto", "on", "off" });
+        // FM4_WHEEL_MODE=off (or auto/on) overrides the file, for unattended test boots that must not move the wheel.
+        if (const char* e = std::getenv("FM4_WHEEL_MODE"); e && *e)
+            for (const char* a : { "auto", "on", "off" })
+                if (AuxLower(e) == a)
+                    c.mode = a;
         str("wheel_device", c.device);
         inum("wheel_rotation", c.rotation, 90, 2520);
         inum("wheel_lock", c.lock, 90, 2520);
