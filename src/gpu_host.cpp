@@ -113,6 +113,22 @@ void GpuStart()
         for (const char* name : { "REGPU_SPLIT_ALPHA_TEST", "REGPU_FETCH_SPECIALIZE" })
             if (!getenv(name))
                 _putenv_s(name, "1");
+    // The Vulkan ReGPU's speed switches the FM3 port runs with (its gpu_host.cpp; each off by default in ReGPU). Set only
+    // when not already in the environment; FM4_NO_FM3_DEFAULTS=1 leaves them all off (A/B).
+    // - REGPU_DRAW_THREAD + _SERIAL: the command processor only parses and queues; a draw thread translates the draws.
+    //   Without it FM4 ran everything on the command processor (one thread at ~97%, the limit in races).
+    // - REGPU_ASYNC_PRESENT: the frame end (submit, present, fence) on the replay thread, not the draw thread.
+    // - REGPU_VERTEX_ARENA: large vertex buffers kept in VRAM, copied again only when written (write watch).
+    // - REGPU_LEAN_FETCH, REGPU_FETCH_VARIANTS: plain texture fetches take the short path / a pixel shader variant.
+    // - REGPU_EXP_LAZY_LOOPS, REGPU_DIRECT_DYNAMIC_INDICES: per-draw work skipped where nothing changed.
+    if (!getenv("FM4_NO_FM3_DEFAULTS"))
+    {
+        const char* fm3Defaults[] = { "REGPU_DRAW_THREAD", "REGPU_DRAW_THREAD_SERIAL", "REGPU_ASYNC_PRESENT", "REGPU_VERTEX_ARENA",
+            "REGPU_LEAN_FETCH", "REGPU_FETCH_VARIANTS", "REGPU_EXP_LAZY_LOOPS", "REGPU_DIRECT_DYNAMIC_INDICES" };
+        for (const char* name : fm3Defaults)
+            if (!getenv(name))
+                _putenv_s(name, "1");
+    }
     host.resolveWriteback = [](const regpu::ResolveCopy& c) {
         regpu::Writeback w;
         static LiveSwitch off("FM4_NO_ROAD_WRITEBACK"); // live
