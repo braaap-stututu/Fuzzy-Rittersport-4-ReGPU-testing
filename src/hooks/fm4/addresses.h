@@ -41,3 +41,8 @@
 #define FM4_RACE_START_UPDATE_IMPL          __imp__sub_8239D018
 #define FM4_CAR_DRIVER_SETUP                sub_82A9E110
 #define FM4_CAR_DRIVER_SETUP_IMPL           __imp__sub_82A9E110
+//   D3D's GPU wait round sub_826EDE50 (FM3 sub_824AAA68): 32 db16cyc delays and a check of the command processor's
+//     progress; answers r3 = 1 to go on waiting. Its callers loop on it (the render thread waiting for ring space or
+//     a fence): hooks/fm4/ring_wait.cpp sleeps between rounds.
+#define FM4_GPU_WAIT_ROUND                  sub_826EDE50
+#define FM4_GPU_WAIT_ROUND_IMPL             __imp__sub_826EDE50
