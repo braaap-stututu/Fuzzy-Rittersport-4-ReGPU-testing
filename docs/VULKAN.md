@@ -111,6 +111,23 @@ default, set in `gpu_host.cpp`):
   (Graphics: "Fps counter and frame-time graph", "Timer"; `settings.ini` `fps_panel`, `timer`). On the user's PC it is
   published to `target\build\launcher-vulkan`, which `FM4 Launcher (Vulkan).cmd` starts. The `fm4-perf` launcher keeps the keys.
 
+Radeon GPU Profiler capture (21 Nov 2026, 1440p 4x grid; `work\bench\rgp`):
+
+- Taken minimized with `work\bench\rgpcapture.py` (RDTS `RadeonDeveloperPanelCLI`, draw mode: a minimized game doesn't
+  present, so frame mode never triggers). Read without screenshots: `rgpchunks.py` (the .rgp's pipeline binaries),
+  `rgppipes.py` (their registers, scratch, exports, sizes), `rgpscroll.ps1` / `rgpevents.ps1` (the open RGP window's
+  tables through UI Automation), `rgpjoin.py`, `rgpdraws.py`, `rgpbarriers.py`.
+- Draws are ~94% of the GPU work; barriers 1.7% of the frame (one 126 us drain after the road write-back copy; most
+  barriers flush and invalidate every cache); clears ~1%; no decompressions or fast-clear eliminates.
+- Wavefront occupancy is low most of the frame and "not limited": the GPU waits between small draws. All 8 hardware
+  contexts cycle (2,794 context rolls for 6,048 draws: vertex export count, pixel input count, kill, viewport).
+- A small draw right after a pipeline switch: median 7.9 us against 5.3 us without one. Export count changed or not:
+  8.3 against 7.8 us.
+- The spilling, register-heavy vertex shaders correlated with slow draws, but cutting them (ReGPU `45542e4`,
+  `REGPU_SPIRV_FINITE_MUL`: vertex code -17%, pipelines at >= 100 SGPRs 789 -> 507) left the grid's GPU time the same
+  (3.50 ms). Not the limit on the 7900 XTX; left off.
+- Every colour surface is R16G16B16A16_SFLOAT (2560x2048 for the 1440p main targets).
+
 ## Testing (no window in the way)
 
 Scripts in `ReGPU-V\work\bench`:
