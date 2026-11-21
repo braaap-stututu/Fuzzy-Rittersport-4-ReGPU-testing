@@ -12,10 +12,7 @@
 #include "log.h"
 #include "memory.h"
 
-namespace regpu
-{
-void RendererLogCrashContext(); // (ReGPU's internal renderer.h is not a public header)
-}
+#include "regpu/regpu.h" // regpu::LogCrashContext (the Vulkan ReGPU: public)
 
 namespace
 {
@@ -88,7 +85,7 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info)
         Describe(frame.AddrPC.Offset, where, sizeof(where));
         Log("CRASH:   #%d %s", i, where);
     }
-    regpu::RendererLogCrashContext();
+    regpu::LogCrashContext();
     Log("CRASH: other threads:");
     LogGuestThreads();
     LogFlush();

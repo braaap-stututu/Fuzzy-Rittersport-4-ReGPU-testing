@@ -32,7 +32,9 @@ foreach(image ${FM4_IMAGES})
     endif()
     add_library(${name}_ppc STATIC ${sources})
     target_include_directories(${name}_ppc PRIVATE "${ppc_dir}" thirdparty/XenonRecomp/thirdparty/simde)
-    target_compile_options(${name}_ppc PRIVATE -Wno-everything -msse4.1 -fno-strict-aliasing
+    # -mcx16: MSVC's <atomic> marks its functions target("cx16"); without it clang-cl calls every std::atomic access and
+    # fence (the recompiled code's sync/lwsync) instead of inlining it (FM3 port: +10% CPU-bound).
+    target_compile_options(${name}_ppc PRIVATE -Wno-everything -msse4.1 -mcx16 -fno-strict-aliasing
         -gline-tables-only "/FI${CMAKE_SOURCE_DIR}/src/ppc_hooks.h")
     # The recompiled code reads the host's raw timestamp counter for mftb; give it the console's
     # timebase instead (tools/patch_mftb.py, Fm2Timebase in src/kernel/runtime.cpp).
@@ -76,8 +78,15 @@ set(FM4_DLSS "${CMAKE_SOURCE_DIR}/thirdparty/dlss")
 set(REGPU_XENONRECOMP "${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp")
 set(REGPU_PPC_DIR "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/ppc")
 set(REGPU_FFX "${FM4_FFX}")
-if(EXISTS "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll")
+# The Vulkan ReGPU (braaap-stututu/ReGPU, branch vulkan; FM4_REGPU_DIR) needs the SDK's Vulkan DLLs (2.4.0 or newer).
+if(EXISTS "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_vk.dll")
     set(REGPU_FSR3 ON)
+endif()
+# Vulkan: the translated shaders are compiled to SPIR-V by DXC at run time (dxcompiler.dll + dxil.dll beside fm4.exe; a
+# DirectXShaderCompiler release or the Vulkan SDK's, FM4_DXC_DIR); ReGPU's own compute shaders need dxc.exe.
+set(FM4_DXC_DIR "$ENV{VULKAN_SDK}/Bin" CACHE PATH "Folder with dxc.exe, dxcompiler.dll and dxil.dll (SPIR-V output)")
+if(EXISTS "${FM4_DXC_DIR}/dxc.exe")
+    set(REGPU_DXC_EXE "${FM4_DXC_DIR}/dxc.exe" CACHE FILEPATH "DXC with SPIR-V output (for ReGPU's embedded compute shaders)")
 endif()
 if(EXISTS "${FM4_DLSS}/include/nvsdk_ngx.h")
     set(REGPU_DLSS ON)
@@ -88,7 +97,9 @@ endif()
 if(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/directx-headers/include/directx/d3d12.h")
     set(REGPU_DIRECTX_HEADERS "${CMAKE_SOURCE_DIR}/thirdparty/directx-headers")
 endif()
-add_subdirectory(thirdparty/ReGPU)
+# FM4_REGPU_DIR: which ReGPU to build (default the vendored D3D12 copy in thirdparty/ReGPU).
+set(FM4_REGPU_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ReGPU" CACHE PATH "ReGPU source folder")
+add_subdirectory("${FM4_REGPU_DIR}" regpu)
 
 add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm4.rc")
 target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
@@ -96,8 +107,13 @@ target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
 target_link_libraries(fm4 PRIVATE regpu)
 if(REGPU_FSR3)
     add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${FM4_FFX}/signedbin/amd_fidelityfx_loader_dx12.dll" "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_dx12.dll" $<TARGET_FILE_DIR:fm4>)
+        "${FM4_FFX}/signedbin/amd_fidelityfx_loader_vk.dll" "${FM4_FFX}/signedbin/amd_fidelityfx_upscaler_vk.dll" $<TARGET_FILE_DIR:fm4>)
 endif()
+foreach(FM4_DXC_DLL dxcompiler.dll dxil.dll)
+    if(EXISTS "${FM4_DXC_DIR}/${FM4_DXC_DLL}")
+        add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FM4_DXC_DIR}/${FM4_DXC_DLL}" $<TARGET_FILE_DIR:fm4>)
+    endif()
+endforeach()
 if(REGPU_DLSS)
     add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${FM4_DLSS}/lib/Windows_x86_64/rel/nvngx_dlss.dll" $<TARGET_FILE_DIR:fm4>)
@@ -108,6 +124,7 @@ if(EXISTS "${REGPU_D3DCOMPILER}")
         "${REGPU_D3DCOMPILER}" $<TARGET_FILE_DIR:fm4>)
 endif()
 target_link_libraries(fm4 PRIVATE ${FM4_PPC_LIBS} XenonUtils synchronization winmm onecore)
+target_compile_options(fm4 PRIVATE -mcx16)
 target_compile_definitions(fm4 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_compile_options(fm4 PRIVATE -gline-tables-only)
 target_link_options(fm4 PRIVATE /STACK:0x1000000 /DEBUG)

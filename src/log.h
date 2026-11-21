@@ -9,6 +9,10 @@ void Log(const char* fmt, ...);
 // Waits (up to 5 s) until the writer thread has written everything queued: before the process dies.
 void LogFlush();
 [[noreturn]] void Fatal(const char* fmt, ...);
+// (No-op: the log is open from the start.) For ReGPU.
+void LogStart();
+// Seconds since the log started (the clock of the [time] stamps).
+double LogSeconds();
 // The last n lines (up to 2000 are kept), for the debug server.
 std::vector<std::string> LogTail(size_t n);
 

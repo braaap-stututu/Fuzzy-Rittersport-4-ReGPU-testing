@@ -37,7 +37,9 @@ void ApplySettings(regpu::Config& c)
     c.maxFps = s.maxFps;
     c.enhance = s.enhance;
     c.msaa = s.msaa;
-    c.smaa = s.smaa;
+    // SMAA (settings smaa=1-4): the Vulkan ReGPU's SMAA post-filter (one quality: the setting's level is not used).
+    if (s.smaa)
+        c.postAA = regpu::Config::PostAA::Smaa;
     c.upscaler = regpu::Config::Upscaler(uint32_t(s.upscaler));
     c.quality = s.quality;
     c.sharpness = s.sharpness;

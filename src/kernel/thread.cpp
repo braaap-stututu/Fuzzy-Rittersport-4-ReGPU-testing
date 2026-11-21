@@ -572,10 +572,7 @@ void SpikeDump(double ms)
     }
 }
 
-namespace regpu
-{
-extern HANDLE g_profiledWorker; // ReGPU's first draw piece worker (src/gpu/renderer.cpp)
-}
+extern HANDLE g_profiledWorker; // ReGPU's first draw piece worker (src/gpu/renderer.cpp; global in the Vulkan ReGPU)
 
 // Sampling profiler (FM2_SAMPLE_THREAD=<guest thread id>; FM2_PROFILE is the profile name): every millisecond, read the
 // thread's instruction pointer and count it per function; the top of the table
@@ -595,7 +592,7 @@ void StartThreadProfiler()
             Sleep(1);
             HANDLE handle = nullptr;
             if (env[0] == 'w')
-                handle = regpu::g_profiledWorker;
+                handle = g_profiledWorker;
             else
             {
                 std::lock_guard lock(g_threadsMutex);

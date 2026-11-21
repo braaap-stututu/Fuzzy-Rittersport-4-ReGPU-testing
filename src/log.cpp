@@ -90,6 +90,15 @@ void Write(const char* prefix, const char* fmt, va_list args)
 }
 }
 
+// The Vulkan ReGPU's log hooks (its own log.cpp otherwise links in beside this one): the log is open from the start,
+// and LogSeconds is the [time] stamps' clock.
+void LogStart() {}
+
+double LogSeconds()
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+}
+
 void LogFlush()
 {
     std::unique_lock lock(g_logMutex);
