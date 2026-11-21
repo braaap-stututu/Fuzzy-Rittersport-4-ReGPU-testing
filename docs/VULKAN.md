@@ -84,6 +84,20 @@ ReGPU `e30f7cb`: a large vertex buffer's "is it changing" answer is now kept per
 not hashed in it. Before, every fetch of a quiet buffer took a mutex and a map lookup (9% of the draw thread at 720p).
 720p grid, live A/B: 263 -> 279 fps.
 
+GPU side (22 Nov 2026 night; the user: "optimize the GPU side until it catches up to the CPU side"):
+
+- The CPU ceiling: the same AI race at 720p 1x (the GPU nearly idle) runs 304 fps, 1% low 202. At 1440p 4x the GPU was
+  slower than that ceiling in a quarter of the race's seconds (`work\bench\gpuvscpu.py`).
+- **`REGPU_FETCH_SPECIALIZE`, now on by default** (`gpu_host.cpp`; `FM4_NO_FETCH_SPECIALIZE=1` off): each pixel shader's
+  fetches compiled for the draw's fetch constants. Live in one boot: GPU 3.59 -> 3.10 ms. AI race at the same clock:
+  296.4 -> 307.4 fps, 1% low 204 -> 213, 0.1% low 171 -> 182 (the CPU ceiling). It also ends the "slow boots" (the same
+  grid at 3.3-3.6 ms instead of 3.1): every boot with it ran 3.11-3.18. Screenshot: 4 of 3.7 M pixels differ, by <= 7/255.
+- **`REGPU_VS_SPECIALIZE`, now on by default** (ReGPU `ad8798b`; `FM4_NO_VS_SPECIALIZE=1` off): vertex shaders compiled
+  for their draws' wrapper words (viewport transform, index source, points, rectangles, vertex fetch endian and buffer).
+  Vertex shaders offline: median 1,441 -> 712 GPU instructions. Live in one boot, alternated: GPU 3.14 -> 3.01 ms;
+  screenshots identical.
+- Races alternated afterwards were not comparable (other programs were using the PC, 242-269 fps for both).
+
 ## Testing (no window in the way)
 
 Scripts in `ReGPU-V\work\bench`:
@@ -97,6 +111,12 @@ Scripts in `ReGPU-V\work\bench`:
 - `fm4route.py`: presses into the race until a log line appears.
 - `resdiff.py`: compares two folders of resolve dumps.
 - Profile: `tools/perf/sample.py <pid> topN <s> <exe>`, with `LLVM_SYMBOLIZER` set to the toolchain's.
+- `fm4gpu.ps1 -Label x [-Extra @{}]`: the 1440p 4x grid's GPU time for one boot, with the GPU clock.
+- `expdraw.py LOG NAME v1 v2 [--switch] [--rounds N]`: sets an env variable (or, `--switch`, a live switch) to each value
+  in turn on the running game and prints the GPU time per frame for each: A/B inside one boot.
+- `shotab.py NAME OUTDIR`: screenshots with a live switch off and on, compared pixel by pixel.
+- `shaderlab\count.py <folder>`: compiles `.spv` files for gfx1100 with the RDTS's amdllpc and counts instructions
+  (`regpu_spirv_check --no-dxc --keep <folder> [--vs-spec <vte>] <.ucode files>` writes them).
 - `fm4grid.ps1 -Label x [-Extra @{}]`: boots to the 720p 1x grid (CPU-bound), settles, prints the median fps and the
   GPU time per frame. The GPU time of the same frame moves between 2.26 and 3.4 ms from boot to boot, with load on the
   PC from other programs: compare boots only at the same GPU time, or alternate them.

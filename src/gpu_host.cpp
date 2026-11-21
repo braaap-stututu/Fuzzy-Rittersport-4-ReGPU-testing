@@ -138,6 +138,21 @@ void GpuStart()
             if (!getenv(name))
                 _putenv_s(name, "1");
     }
+    // REGPU_FETCH_SPECIALIZE (live in ReGPU, off there by default): each pixel shader's texture fetches compiled for the
+    // fetch constants of the draw (a variant per material: its words as literals), so a fetch is one sample plus only
+    // the steps its constant asks for, instead of every format's path behind runtime tests (direct shaders: median ~3,200
+    // GPU instructions a pixel shader). Fewer instructions to load at each of the ~1,170 pipeline switches a frame.
+    // 1440p 4x grid, live in one boot: GPU 3.59 -> 3.10 ms; AI race at the same clock (3,050 MHz): 296.4 -> 307.4 fps,
+    // 1% low 204 -> 213. Without it some boots ran the grid 1.3x slower on the GPU. Screenshot: 4 of 3.7 M pixels differ,
+    // by at most 7/255. FM4_NO_FETCH_SPECIALIZE=1 leaves it off (or "switch REGPU_FETCH_SPECIALIZE 0" live).
+    if (!getenv("FM4_NO_FETCH_SPECIALIZE") && !getenv("REGPU_FETCH_SPECIALIZE"))
+        _putenv_s("REGPU_FETCH_SPECIALIZE", "1");
+    // REGPU_VS_SPECIALIZE (live in ReGPU, off there by default): each vertex shader compiled for its draws' wrapper words
+    // (viewport transform, index source, points, rectangles, each vertex fetch's endian swap and buffer) instead of testing
+    // them for every vertex (median ~1,440 GPU instructions a vertex shader, ~710 specialised). 1440p 4x grid, live in
+    // one boot, alternated: GPU 3.14 -> 3.01 ms; screenshot identical. FM4_NO_VS_SPECIALIZE=1 leaves it off.
+    if (!getenv("FM4_NO_VS_SPECIALIZE") && !getenv("REGPU_VS_SPECIALIZE"))
+        _putenv_s("REGPU_VS_SPECIALIZE", "1");
     host.resolveWriteback = [](const regpu::ResolveCopy& c) {
         regpu::Writeback w;
         static LiveSwitch off("FM4_NO_ROAD_WRITEBACK"); // live
