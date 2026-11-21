@@ -19,10 +19,10 @@ in `ReGPU-V\work\fm4vk-build`, with junctions to `target\`'s XenonRecomp, `out\p
 ## Playing it (the user's PC)
 
 `FM4 Launcher (Vulkan).cmd`, in the workspace folder beside `FM4 Launcher.lnk`, starts the same launcher with
-`FM4_EXE` set to `targetuildm4-vulkanm4.exe`. The launcher runs `FM4_EXE` when it is set (`Install.cs`,
+`FM4_EXE` set to `target\build\fm4-vulkan\fm4.exe`. The launcher runs `FM4_EXE` when it is set (`Install.cs`,
 `Paths.Exe`). That folder is a copy of the development build, refreshed by hand after a rebuild.
 
-Saves and settings are the same (`Documentsm4`). The Vulkan shader caches don't clash with D3D12's:
+Saves and settings are the same (`Documents\fm4`). The Vulkan shader caches don't clash with D3D12's:
 `.vk1.spv` and `vk-pipelines-*.bin` against `.dxbc` and `pipelines.bin`; the `.ucode` files are the same microcode.
 The shortcut starts the D3D12 build as before.
 
