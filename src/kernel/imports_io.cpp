@@ -11,6 +11,7 @@
 #include "kernel/runtime.h"
 #include "live_switch.h"
 #include "loader.h"
+#include "memory.h"
 #include "kernel/vfs.h"
 
 namespace fs = std::filesystem;
@@ -402,6 +403,7 @@ GUEST_EXPORT(NtReadFile)
         g_binkRingBase = buffer - uint32_t(offset % 0x200000);
     }
     const auto readStart = std::chrono::steady_clock::now();
+    GuestWillWrite(buffer, length); // (a write-watched page makes the kernel's write fail instead of faulting)
     const BOOL ok = ReadFile(file->host, GuestPtr(buffer), length, &read, &ov);
     file->position = offset + read;
     g_readBytes += read;

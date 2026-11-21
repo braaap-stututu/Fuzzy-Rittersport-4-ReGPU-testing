@@ -56,6 +56,15 @@ void GpuStart()
     regpu::Host& host = regpu::GetHost();
     host.base = g_base;
     host.physicalSection = PhysicalSection();
+    // Write watch (memory.cpp, as FM3): ReGPU keeps the hashes of vertex ranges, index buffers and shader loads none of
+    // whose pages was written since, instead of hashing them again at every first use in a frame.
+    // FM4_NO_WRITE_WATCH=1: none (hashed as before).
+    if (!getenv("FM4_NO_WRITE_WATCH"))
+    {
+        host.watchArm = [](uint32_t offset, uint32_t bytes) { return WriteWatchArm(offset, bytes); };
+        host.watchClean = [](uint32_t offset, uint32_t bytes, uint64_t since) { return WriteWatchClean(offset, bytes, since); };
+        host.watchSeq = [] { return WriteWatchSeq(); };
+    }
     host.alloc = [](bool physical, uint32_t size, uint32_t align) {
         return GuestAlloc(physical ? Heap::Physical : Heap::Virtual, size, align);
     };

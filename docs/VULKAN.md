@@ -73,6 +73,17 @@ rounds (`sub_826EDE50`) instead of spinning. Frozen grid, live: guest 7 drops fr
 from 3.9-4.4 to 3.6-3.8 cores, with fps the same. `FM4_RING_WAIT=0` spins as before. This matters on 4-core CPUs
 (the Deck).
 
+Write watch (`memory.cpp`, from FM3; `Host::watchArm`/`watchClean`/`watchSeq` in `gpu_host.cpp`): the pages of vertex
+ranges, index buffers and shader loads are made read-only, and the first write to one faults and marks its 64 KB as
+written. ReGPU keeps the hash of a range none of whose pages was written since, instead of hashing it again at its first
+use in each frame. `NtReadFile` disarms its buffer first (the kernel's write fails on a read-only page instead of
+faulting). About 30 faults a second on the grid. `FM4_NO_WRITE_WATCH=1` turns it off; `FM4_WATCH_LOG=1` logs the
+faults. 720p grid, boots alternated: +3-9% against the boot after each.
+
+ReGPU `e30f7cb`: a large vertex buffer's "is it changing" answer is now kept per thread for the frame even when it was
+not hashed in it. Before, every fetch of a quiet buffer took a mutex and a map lookup (9% of the draw thread at 720p).
+720p grid, live A/B: 263 -> 279 fps.
+
 ## Testing (no window in the way)
 
 Scripts in `ReGPU-V\work\bench`:
@@ -86,6 +97,9 @@ Scripts in `ReGPU-V\work\bench`:
 - `fm4route.py`: presses into the race until a log line appears.
 - `resdiff.py`: compares two folders of resolve dumps.
 - Profile: `tools/perf/sample.py <pid> topN <s> <exe>`, with `LLVM_SYMBOLIZER` set to the toolchain's.
+- `fm4grid.ps1 -Label x [-Extra @{}]`: boots to the 720p 1x grid (CPU-bound), settles, prints the median fps and the
+  GPU time per frame. The GPU time of the same frame moves between 2.26 and 3.4 ms from boot to boot, with load on the
+  PC from other programs: compare boots only at the same GPU time, or alternate them.
 - Always mirror the launcher's switches. Without `REGPU_RESOLVE_WRITEBACK_MAX` the GPU time was 12 ms instead of 4.7.
 
 ## Next
