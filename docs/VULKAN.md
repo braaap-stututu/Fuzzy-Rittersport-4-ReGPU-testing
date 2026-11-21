@@ -92,11 +92,13 @@ GPU side (21 Nov 2026 night; the user: "optimize the GPU side until it catches u
   fetches compiled for the draw's fetch constants. Live in one boot: GPU 3.59 -> 3.10 ms. AI race at the same clock:
   296.4 -> 307.4 fps, 1% low 204 -> 213, 0.1% low 171 -> 182 (the CPU ceiling). It also ends the "slow boots" (the same
   grid at 3.3-3.6 ms instead of 3.1): every boot with it ran 3.11-3.18. Screenshot: 4 of 3.7 M pixels differ, by <= 7/255.
-- **`REGPU_VS_SPECIALIZE`, now on by default** (ReGPU `ad8798b`; `FM4_NO_VS_SPECIALIZE=1` off): vertex shaders compiled
-  for their draws' wrapper words (viewport transform, index source, points, rectangles, vertex fetch endian and buffer).
-  Vertex shaders offline: median 1,441 -> 712 GPU instructions. Live in one boot, alternated: GPU 3.14 -> 3.01 ms;
-  screenshots identical.
-- Races alternated afterwards were not comparable (other programs were using the PC, 242-269 fps for both).
+- `REGPU_VS_SPECIALIZE` (ReGPU `ad8798b`, live, **left off**): vertex shaders compiled for their draws' wrapper words
+  (viewport transform, index source, points, rectangles, vertex fetch endian and buffer). Vertex shaders offline: median
+  1,441 -> 712 GPU instructions. Grid, live in one boot: GPU 3.14 -> 3.01 ms, screenshots identical. But AI races on an
+  idle PC, alternated on/off/off/on/on/off at the same clock: on 227, 256, 274 fps (1% low 138-158), off 305, 289, 273
+  (1% low 171-206); race GPU time 3.52 against 3.26 ms. Likely: draws that shared a pipeline split into variants (a
+  buffer read in place for one draw and copied for the next), so more switches, and the variants (not in the manifest)
+  are built during the race. Worth another try with fewer words specialised (not the buffer) and the variants kept.
 
 ## Testing (no window in the way)
 

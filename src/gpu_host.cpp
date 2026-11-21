@@ -147,12 +147,9 @@ void GpuStart()
     // by at most 7/255. FM4_NO_FETCH_SPECIALIZE=1 leaves it off (or "switch REGPU_FETCH_SPECIALIZE 0" live).
     if (!getenv("FM4_NO_FETCH_SPECIALIZE") && !getenv("REGPU_FETCH_SPECIALIZE"))
         _putenv_s("REGPU_FETCH_SPECIALIZE", "1");
-    // REGPU_VS_SPECIALIZE (live in ReGPU, off there by default): each vertex shader compiled for its draws' wrapper words
-    // (viewport transform, index source, points, rectangles, each vertex fetch's endian swap and buffer) instead of testing
-    // them for every vertex (median ~1,440 GPU instructions a vertex shader, ~710 specialised). 1440p 4x grid, live in
-    // one boot, alternated: GPU 3.14 -> 3.01 ms; screenshot identical. FM4_NO_VS_SPECIALIZE=1 leaves it off.
-    if (!getenv("FM4_NO_VS_SPECIALIZE") && !getenv("REGPU_VS_SPECIALIZE"))
-        _putenv_s("REGPU_VS_SPECIALIZE", "1");
+    // REGPU_VS_SPECIALIZE (ReGPU, live) is left off: on the grid, live, GPU 3.14 -> 3.01 ms, but in AI races alternated on
+    // an idle PC (3 each, same clock) 252 fps on against 289 off, race GPU time 3.52 against 3.26 ms (more distinct
+    // pipelines between draws, and its variants built during the race). "switch REGPU_VS_SPECIALIZE 1" to try it.
     host.resolveWriteback = [](const regpu::ResolveCopy& c) {
         regpu::Writeback w;
         static LiveSwitch off("FM4_NO_ROAD_WRITEBACK"); // live
