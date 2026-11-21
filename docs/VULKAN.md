@@ -84,7 +84,7 @@ ReGPU `e30f7cb`: a large vertex buffer's "is it changing" answer is now kept per
 not hashed in it. Before, every fetch of a quiet buffer took a mutex and a map lookup (9% of the draw thread at 720p).
 720p grid, live A/B: 263 -> 279 fps.
 
-GPU side (22 Nov 2026 night; the user: "optimize the GPU side until it catches up to the CPU side"):
+GPU side (21 Nov 2026 night; the user: "optimize the GPU side until it catches up to the CPU side"):
 
 - The CPU ceiling: the same AI race at 720p 1x (the GPU nearly idle) runs 304 fps, 1% low 202. At 1440p 4x the GPU was
   slower than that ceiling in a quarter of the race's seconds (`work\bench\gpuvscpu.py`).
