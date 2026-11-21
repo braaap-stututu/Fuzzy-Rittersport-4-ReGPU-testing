@@ -80,13 +80,17 @@ public sealed class GameSettings
     public string TitleUpdateFolder { get; set; } = "";
     public int Sharpening { get; set; } = 50; // percent; settings.ini holds 0-1
     public bool HideShaderOverlay { get; set; } // launcher only: sets REGPU_NO_OVERLAY at launch
+    // Read by the game (the Vulkan build, gpu_host.cpp; on unless the file says 0): ReGPU's timer (the log clock, top left)
+    // and fps panel (fps, frame times and a frame-time graph, top centre). The D3D12 build ignores them.
+    public bool Timer { get; set; } = true;
+    public bool FpsPanel { get; set; } = true;
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch
     public int Language { get; set; } = 1;
 
     // What fm4.exe reads (src/settings.cpp). FM2's later options (SMAA, anisotropy, render scale, vertex arena, the
     // shader pop-up, music) have no counterpart in FM4's runtime yet, so they aren't offered. The racing wheel's
     // wheel_* keys are the Wheel stuff tab's (Wheel.cs); Save keeps them like any other key it doesn't know.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "game_folder", "title_update_folder", "enhance", "hide_shader_overlay", "language"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "game_folder", "title_update_folder", "enhance", "hide_shader_overlay", "language", "timer", "fps_panel"];
 
     public static GameSettings Load()
     {
@@ -116,6 +120,8 @@ public sealed class GameSettings
                         ? (int)Math.Round(sh * 100) : 50;
                     break;
                 case "hide_shader_overlay": s.HideShaderOverlay = v == "1"; break;
+                case "timer": s.Timer = v != "0"; break;
+                case "fps_panel": s.FpsPanel = v != "0"; break;
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
             }
@@ -130,6 +136,7 @@ public sealed class GameSettings
         sb.Append($"profile={(profile.Length > 0 ? profile : "Player")}\n");
         sb.Append($"resolution={Resolution}\naspect={Aspect}\nfullscreen={B(Fullscreen)}\nvsync={B(Vsync)}\n");
         sb.Append($"max_fps={Math.Clamp(MaxFps, 30, 360)}\nmsaa={Msaa}\nsmaa={Math.Clamp(Smaa, 0, 4)}\nanisotropy={B(Anisotropy)}\nfast_mode={B(FastMode)}\nenhance={B(Enhance)}\nhide_shader_overlay={B(HideShaderOverlay)}\nlanguage={Language}\n");
+        sb.Append($"timer={B(Timer)}\nfps_panel={B(FpsPanel)}\n");
         var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
         sb.Append($"upscaler={(Options.Upscalers.Any(u => u.Value == Upscaler) ? Upscaler : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
         sb.Append($"optimize_level={Math.Clamp(OptimizeLevel, 0, 3)}\ndebug_view={(DebugView is "motion" or "depth" ? DebugView : "off")}\nperf_log={B(PerfLog)}\ngame_folder={Clean(GameFolder)}\ntitle_update_folder={Clean(TitleUpdateFolder)}\n");

@@ -164,6 +164,14 @@
         <div><div class="toggle-title">Hide shader compile box</div><div class="toggle-sub">Top left of the screen</div></div>
         <button class="switch" id="hideShaderOverlay" role="switch"></button>
       </div>
+      <div class="toggle-row" data-tip="Frames per second, the average and slowest (99th percentile) frame times, and a graph of the last 400 frames: green, yellow when a frame takes over 1.5x the average, red over 2x. Vulkan build only.">
+        <div><div class="toggle-title">Fps counter and frame-time graph</div><div class="toggle-sub">Top centre of the screen</div></div>
+        <button class="switch" id="fpsPanel" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="A clock in seconds since the game started, to a tenth of a second: a screenshot then says where to look in the game's log. Vulkan build only.">
+        <div><div class="toggle-title">Timer</div><div class="toggle-sub">Top left of the screen</div></div>
+        <button class="switch" id="timer" role="switch"></button>
+      </div>
     </section>
 
     <div class="stack">

@@ -107,8 +107,9 @@ default, set in `gpu_host.cpp`):
   `FM4_NO_TIMER=1` hides it.
 - the fps panel (`REGPU_FPS_PANEL`): fps, average and p99 frame time, and a graph of the last 400 frames' times
   (green, yellow over 1.5x the average, red over 2x), top centre. `settings.ini` `fps_panel=0` hides it.
-- Both are live switches (debug server `switch REGPU_TIMER 0|1`). FM4's launcher has no checkboxes for them yet; it
-  keeps the two keys when it saves.
+- Both are live switches (debug server `switch REGPU_TIMER 0|1`). The launcher on this branch has checkboxes for them
+  (Graphics: "Fps counter and frame-time graph", "Timer"; `settings.ini` `fps_panel`, `timer`). On the user's PC it is
+  published to `target\build\launcher-vulkan`, which `FM4 Launcher (Vulkan).cmd` starts. The `fm4-perf` launcher keeps the keys.
 
 ## Testing (no window in the way)
 
