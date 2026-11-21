@@ -89,6 +89,11 @@ void GpuStart()
     // frame of texture checks in a race, no visible change). FM4_TEXTURE_CHECK_EVERY_FRAME=1: every frame.
     if (!getenv("FM4_TEXTURE_CHECK_EVERY_FRAME") && !getenv("REGPU_TEXTURE_CHECK_STAGGER"))
         _putenv_s("REGPU_TEXTURE_CHECK_STAGGER", "1");
+    // Gamma-signed texture components (fetch sign mode 3) converted to linear when fetched, as the console does (the
+    // Vulkan ReGPU has it opt-in, REGPU_TEXTURE_GAMMA; its D3D12 copy here always did). Without it the colour maps stayed
+    // in gamma: the whole picture came out washed out and too bright (grid mean 121 against 92). FM4_NO_TEXTURE_GAMMA=1: off.
+    if (!getenv("FM4_NO_TEXTURE_GAMMA") && !getenv("REGPU_TEXTURE_GAMMA"))
+        _putenv_s("REGPU_TEXTURE_GAMMA", "1");
     // These write-backs come every frame; a fence held behind each (REGPU's default for a small write-back)
     // tied the game to the GPU every frame (about 60 -> 43 fps). The image is rebuilt continuously, so a
     // copy landing a frame late is harmless: fences are not held. FM4_WRITEBACK_FENCES=1 holds them (A/B).
