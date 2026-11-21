@@ -100,6 +100,16 @@ GPU side (21 Nov 2026 night; the user: "optimize the GPU side until it catches u
   buffer read in place for one draw and copied for the next), so more switches, and the variants (not in the manifest)
   are built during the race. Worth another try with fewer words specialised (not the buffer) and the variants kept.
 
+On-screen aids (as FM3 and PGR3, drawn by ReGPU's presenter onto the back buffer, never into the game's images; on by
+default, set in `gpu_host.cpp`):
+
+- the timer (`REGPU_TIMER`): the log clock to a tenth of a second, top left. `settings.ini` `timer=0` or
+  `FM4_NO_TIMER=1` hides it.
+- the fps panel (`REGPU_FPS_PANEL`): fps, average and p99 frame time, and a graph of the last 400 frames' times
+  (green, yellow over 1.5x the average, red over 2x), top centre. `settings.ini` `fps_panel=0` hides it.
+- Both are live switches (debug server `switch REGPU_TIMER 0|1`). FM4's launcher has no checkboxes for them yet; it
+  keeps the two keys when it saves.
+
 ## Testing (no window in the way)
 
 Scripts in `ReGPU-V\work\bench`:

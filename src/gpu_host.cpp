@@ -147,6 +147,16 @@ void GpuStart()
     // by at most 7/255. FM4_NO_FETCH_SPECIALIZE=1 leaves it off (or "switch REGPU_FETCH_SPECIALIZE 0" live).
     if (!getenv("FM4_NO_FETCH_SPECIALIZE") && !getenv("REGPU_FETCH_SPECIALIZE"))
         _putenv_s("REGPU_FETCH_SPECIALIZE", "1");
+    // FM3's and PGR3's on-screen aids, drawn by ReGPU's presenter, not the game (the user asked, 21 Nov 2026):
+    // - REGPU_TIMER: the log clock, to a tenth of a second, in the top-left corner (a screenshot says where to look in the
+    //   log). settings.ini timer=0 or FM4_NO_TIMER=1 hides it.
+    // - REGPU_FPS_PANEL: fps, frame times and a frame-time graph at the top centre. settings.ini fps_panel=0 hides it.
+    // On by default: FM4's launcher has no checkboxes for them (it keeps the keys when it saves). Live: debug server
+    // "switch REGPU_TIMER 0|1", "switch REGPU_FPS_PANEL 0|1".
+    if (!getenv("FM4_NO_TIMER") && GetSettings().Extra("timer") != "0" && !getenv("REGPU_TIMER"))
+        _putenv_s("REGPU_TIMER", "1");
+    if (GetSettings().Extra("fps_panel") != "0" && !getenv("REGPU_FPS_PANEL"))
+        _putenv_s("REGPU_FPS_PANEL", "1");
     // REGPU_VS_SPECIALIZE (ReGPU, live) is left off: on the grid, live, GPU 3.14 -> 3.01 ms, but in AI races alternated on
     // an idle PC (3 each, same clock) 252 fps on against 289 off, race GPU time 3.52 against 3.26 ms (more distinct
     // pipelines between draws, and its variants built during the race). "switch REGPU_VS_SPECIALIZE 1" to try it.
