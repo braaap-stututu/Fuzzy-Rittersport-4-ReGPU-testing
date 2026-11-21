@@ -1,0 +1,85 @@
+# FM4 on the Vulkan ReGPU (branch `regpu-vulkan`)
+
+Started 21 Nov 2026. This branch builds FM4 against braaap-stututu/ReGPU, branch `vulkan`: the Vulkan-only ReGPU the
+FM3 port moved to. `fm4-perf` keeps the vendored D3D12 copy in `thirdparty/ReGPU`.
+
+## Build
+
+- `FM4_REGPU_DIR=<ReGPU checkout>`: the ReGPU to build. The default is the vendored D3D12 copy.
+- `FM4_DXC_DIR=<folder with dxc.exe, dxcompiler.dll, dxil.dll>`: a DXC with SPIR-V output (a DirectXShaderCompiler
+  release, or the Vulkan SDK's). The default is `$VULKAN_SDK/Bin`.
+- `thirdparty/fidelityfx` must be the FidelityFX SDK **2.4.0** or newer. 2.1.0 has no Vulkan FSR DLLs; without them
+  FSR 3/4 fall back to FSR 1.
+- `-mcx16` is set for the game and ReGPU. MSVC's `<atomic>` marks its functions `target("cx16")`, so without the flag
+  clang-cl calls every `std::atomic` access and fence instead of inlining it.
+
+Development build on the user's PC (`ReGPU-V\work\scripts\buildfm4vk.bat`): the worktree `ReGPU-V\work\fm4vk` is built
+in `ReGPU-V\work\fm4vk-build`, with junctions to `target\`'s XenonRecomp, `out\ppc*`, ffmpeg and game data.
+
+## What FM4 needed on Vulkan
+
+- `REGPU_TEXTURE_GAMMA=1`, set in `gpu_host.cpp`. Gamma-signed texture components are converted to linear on fetch,
+  as the console does. The Vulkan ReGPU has this opt-in; without it the picture is washed out and too bright (grid
+  mean 121 against D3D12's 92, now 90.7). `FM4_NO_TEXTURE_GAMMA=1` turns it off.
+- The soft car-shadow cascade switches (`REGPU_DEPTH_AS_8888`, `REGPU_CASCADE_SLOTS`, `REGPU_CASCADE_B_LIT`), ported to
+  the Vulkan ReGPU in `0e2cfdd`. They are packed into `tinfo.z` bits 16-23, in the HLSL preamble and the SPIR-V
+  translator.
+- API: `regpu::DecodeTexture`, `WritePng`, `CompileIdle` and `BenchmarkRecord`/`BenchmarkWriteReport` are now public
+  in ReGPU (`cee03cf`). `regpu::LogCrashContext` replaces `RendererLogCrashContext`. `LogStart`/`LogSeconds` were added
+  to `src/log.cpp`. `smaa=N` maps to ReGPU's SMAA post-filter.
+- Still from FM4's ReGPU, not ported: `REGPU_COLOR_SURFACE_PER_BPP` (photo mode's 64-bit accumulation) and the
+  other features in ReGPU's `docs/fm4-features-to-port.md`. Photo mode is untested.
+
+## Speed (1440p 4x MSAA, RX 7900 XTX + 9800X3D)
+
+FM3's ReGPU speed defaults are set in `gpu_host.cpp` (`FM4_NO_FM3_DEFAULTS=1` turns them off): the draw thread
+(serial), asynchronous present, the vertex arena, lean fetches, fetch variants, lazy loops and direct dynamic indices.
+Without the draw thread, FM4 ran every draw on the command processor.
+
+ReGPU changes made for FM4 (all of them help every port):
+
+- **Resolve write-backs from half-float images:**
+  - F16C conversion, column spans worked out once, SSE packing, whole-word swaps (`aae02a0`).
+  - Large writes in 32-row bands on the thread pool (`37c283c`).
+  - FM4 writes its 512x512 road image back every frame; the old scalar path was about 40% of the draw thread.
+  - `REGPU_WRITEBACK_VERIFY=1` compares every write with the scalar path byte for byte (86,016 writes, none differ).
+  - `REGPU_SLOW_WRITEBACK=1` and `REGPU_SERIAL_WRITEBACK=1` give the old behaviour.
+
+Frozen grid: 144 fps (launcher switches only) -> 171 (FM3 defaults) -> 241 (fast write-backs). The GPU is now the
+limit there (4.1 ms).
+
+AI benchmark race, measured minimized (frame times at the draw thread's frame end, `REGPU_FRAME_TIMES_SWAP`):
+
+| | fps | 1% low | 0.1% low |
+|---|---|---|---|
+| FM3 defaults, old write-backs | 161.7 | 92.4 | 75.4 |
+| fast write-backs | 234.8 | 138.6 | 84.2 |
+| + parallel bands (4 runs) | ~238 | ~166 | ~139 |
+
+FM4's own D3D12 build (`fm4-perf`) runs the same race at 158.6 fps (visible window, debug-server fps).
+
+## Testing (no window in the way)
+
+Scripts in `ReGPU-V\work\bench`:
+
+- `fm4boot.ps1 [-Exe] [-Log] [-User] [-Extra @{}] [-Route]`: boots minimized with the launcher's switches
+  (`REGPU_EARLY_FENCES=1`, `REGPU_RESOLVE_WRITEBACK_MAX=1024`), wheel off, and `FM4_USER_DIR` set to a copy of the
+  saves, so the shader caches stay apart. `-Route` drives it to the frozen grid.
+- `fm4bench.ps1 -Label x [-Seconds 60] [-Extra @{}]`: an AI benchmark race. `FM4_BENCHMARK` with the race AI driving
+  the player's car (`hooks/fm4/ai_player.cpp`). It works: the car moves from 6th to 2nd in 30 s. Prints the average,
+  p99 and the 1% and 0.1% lows (`ReGPU tools/frametimes.py`).
+- `fm4route.py`: presses into the race until a log line appears.
+- `resdiff.py`: compares two folders of resolve dumps.
+- Profile: `tools/perf/sample.py <pid> topN <s> <exe>`, with `LLVM_SYMBOLIZER` set to the toolchain's.
+- Always mirror the launcher's switches. Without `REGPU_RESOLVE_WRITEBACK_MAX` the GPU time was 12 ms instead of 4.7.
+
+## Next
+
+- GPU: ~1.5 us of fixed GPU time a draw in the main pass and the second view (pass `190000`, 864 draws, 1.24 ms in
+  races). That needs a Radeon GPU Profiler capture.
+- CPU: the game's render thread (guest 7) spins in `sub_826EDE50` (its GPU-wait poll) while the GPU is behind; on a
+  4-core CPU (Deck) that spin costs a core. The game's main thread (guest 3) runs at about 100%.
+- Write-backs: they are still written on the draw thread at the frame-slot reuse. They could move to the background.
+- `REGPU_COPIES_1010102` breaks FM4's front buffer (a `k_2_10_10_10` resolve becomes a 10-bit image the presenter
+  doesn't take). The presenter would need to accept it.
+- Photo mode: `REGPU_COLOR_SURFACE_PER_BPP` is not ported.
