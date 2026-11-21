@@ -58,6 +58,11 @@ AI benchmark race, measured minimized (frame times at the draw thread's frame en
 
 FM4's own D3D12 build (`fm4-perf`) runs the same race at 158.6 fps (visible window, debug-server fps).
 
+Game side: `hooks/fm4/ring_wait.cpp` (FM3's ring wait) makes the render thread sleep ~100 us between D3D GPU-wait
+rounds (`sub_826EDE50`) instead of spinning. Frozen grid, live: guest 7 drops from 95% to 48% of a core and the game
+from 3.9-4.4 to 3.6-3.8 cores, with fps the same. `FM4_RING_WAIT=0` spins as before. This matters on 4-core CPUs
+(the Deck).
+
 ## Testing (no window in the way)
 
 Scripts in `ReGPU-V\work\bench`:
@@ -77,9 +82,9 @@ Scripts in `ReGPU-V\work\bench`:
 
 - GPU: ~1.5 us of fixed GPU time a draw in the main pass and the second view (pass `190000`, 864 draws, 1.24 ms in
   races). That needs a Radeon GPU Profiler capture.
-- CPU: the game's render thread (guest 7) spins in `sub_826EDE50` (its GPU-wait poll) while the GPU is behind; on a
-  4-core CPU (Deck) that spin costs a core. The game's main thread (guest 3) runs at about 100%.
+- CPU: the game's main thread (guest 3) runs at about 100% in races (game code).
 - Write-backs: they are still written on the draw thread at the frame-slot reuse. They could move to the background.
+- `REGPU_COPIES_1010102_BIASED=1` (only biased 10-bit copies, never the front buffer) works but gives +0.3%: left off.
 - `REGPU_COPIES_1010102` breaks FM4's front buffer (a `k_2_10_10_10` resolve becomes a 10-bit image the presenter
   doesn't take). The presenter would need to accept it.
 - Photo mode: `REGPU_COLOR_SURFACE_PER_BPP` is not ported.
