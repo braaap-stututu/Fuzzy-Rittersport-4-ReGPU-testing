@@ -129,6 +129,10 @@ Radeon GPU Profiler capture (21 Nov 2026, 1440p 4x grid; `work\bench\rgp`):
 - Every colour surface is R16G16B16A16_SFLOAT (2560x2048 for the 1440p main targets).
 - Barriers merged back to back and the write-back's host barrier deferred to the next fence (ReGPU `aa92b83`,
   `REGPU_BARRIER_MERGE`, `REGPU_READBACK_BARRIER_DEFER`): the same GPU time (3.52-3.62 against 3.52-3.54 ms); left off.
+- Colour surface formats (`REGPU_TRACE_SURFACE_USE`): the main scene draws 804 draws a frame in 7e3 float and 828 in 7e3 as
+  16-16-16-16 (64-bit on the console too); the second view 444 in 8-8-8-8. Every surface 32-bit instead
+  (`REGPU_EXP_COLOR_FORMAT`, picture wrong): 3.32-3.34 ms against 3.33-3.53 for 64-bit: no gain on the 7900 XTX, so
+  per-format surfaces aren't worth building for it. Try it on the Deck (little memory bandwidth).
 
 ## Testing (no window in the way)
 
