@@ -127,6 +127,8 @@ Radeon GPU Profiler capture (21 Nov 2026, 1440p 4x grid; `work\bench\rgp`):
   `REGPU_SPIRV_FINITE_MUL`: vertex code -17%, pipelines at >= 100 SGPRs 789 -> 507) left the grid's GPU time the same
   (3.50 ms). Not the limit on the 7900 XTX; left off.
 - Every colour surface is R16G16B16A16_SFLOAT (2560x2048 for the 1440p main targets).
+- Barriers merged back to back and the write-back's host barrier deferred to the next fence (ReGPU `aa92b83`,
+  `REGPU_BARRIER_MERGE`, `REGPU_READBACK_BARRIER_DEFER`): the same GPU time (3.52-3.62 against 3.52-3.54 ms); left off.
 
 ## Testing (no window in the way)
 
