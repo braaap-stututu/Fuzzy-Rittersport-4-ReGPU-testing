@@ -16,6 +16,16 @@ FM3 port moved to. `fm4-perf` keeps the vendored D3D12 copy in `thirdparty/ReGPU
 Development build on the user's PC (`ReGPU-V\work\scripts\buildfm4vk.bat`): the worktree `ReGPU-V\work\fm4vk` is built
 in `ReGPU-V\work\fm4vk-build`, with junctions to `target\`'s XenonRecomp, `out\ppc*`, ffmpeg and game data.
 
+## Playing it (the user's PC)
+
+`FM4 Launcher (Vulkan).cmd`, in the workspace folder beside `FM4 Launcher.lnk`, starts the same launcher with
+`FM4_EXE` set to `targetuildm4-vulkanm4.exe`. The launcher runs `FM4_EXE` when it is set (`Install.cs`,
+`Paths.Exe`). That folder is a copy of the development build, refreshed by hand after a rebuild.
+
+Saves and settings are the same (`Documentsm4`). The Vulkan shader caches don't clash with D3D12's:
+`.vk1.spv` and `vk-pipelines-*.bin` against `.dxbc` and `pipelines.bin`; the `.ucode` files are the same microcode.
+The shortcut starts the D3D12 build as before.
+
 ## What FM4 needed on Vulkan
 
 - `REGPU_TEXTURE_GAMMA=1`, set in `gpu_host.cpp`. Gamma-signed texture components are converted to linear on fetch,
