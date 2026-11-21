@@ -104,8 +104,30 @@ Scripts in `ReGPU-V\work\bench`:
 
 ## Next
 
-- GPU: ~1.5 us of fixed GPU time a draw in the main pass and the second view (pass `190000`, 864 draws, 1.24 ms in
-  races). That needs a Radeon GPU Profiler capture.
+- GPU: the race is GPU-bound. The 7900 XTX runs at its board power limit there (~361 W, ~3,050 MHz, 99-100% busy;
+  `work\bench\gpusensors.py`, logged by `fm4bench.ps1`). Where the GPU time goes on the 1440p 4x grid (ReGPU
+  `REGPU_EXP_DRAW`, live):
+
+  | mode | GPU ms |
+  |---|---|
+  | normal | 3.10 |
+  | 1: no draw calls (state still set) | 1.16 |
+  | 2: one triangle a draw | 2.35 |
+  | 4: one triangle drawn twice | 2.41 |
+  | 3: full vertices, 1x1 scissor | 2.14 |
+  | 5: one triangle, only draws with no pipeline switch (1,736) | 1.58 |
+  | 6: one triangle, only draws right after a switch (1,176) | 2.22 |
+
+  A draw call costs ~20 ns. A draw right after a pipeline switch costs ~0.9 us against ~0.24 us: the switches are ~0.78 ms
+  of the 3.1. Pixel shading is ~1 ms. Switches that change the vertex shader cost more than pixel-shader-only ones.
+  The translated shaders are large (`REGPU_SHADER_STATS=1`, 1,184 pipelines; disassembly bytes): vertex shaders median
+  77 KB, p90 134 KB; pixel shaders median 85 KB, p90 267 KB, max 1 MB. A sample vertex shader is ~1,300 instructions,
+  mostly `v_cndmask`/`v_cmp` (predication as selects), with SGPR spills into VGPR lanes; 114 vertex shaders use scratch.
+  The pipelines are monolithic and fully optimised (pipeline libraries are off). Leads: smaller translated shaders
+  (branches instead of selects for predicated blocks), or an RGP capture (`work\tools\RadeonDeveloperToolSuite-*`,
+  `RadeonDeveloperPanelCLI.exe -m profiling`), read in the RGP GUI.
+- Bench noise: on some boots the same frame took the GPU 1.3x longer (clocks or power, not other programs). Compare
+  races at the same "GPU while 90%+ busy" clock that `fm4bench.ps1` prints.
 - CPU: the game's main thread (guest 3) runs at about 100% in races (game code).
 - Write-backs: they are still written on the draw thread at the frame-slot reuse. They could move to the background.
 - `REGPU_COPIES_1010102_BIASED=1` (only biased 10-bit copies, never the front buffer) works but gives +0.3%: left off.
