@@ -158,11 +158,49 @@ Scripts in `ReGPU-V\work\bench`:
   PC from other programs: compare boots only at the same GPU time, or alternate them.
 - Always mirror the launcher's switches. Without `REGPU_RESOLVE_WRITEBACK_MAX` the GPU time was 12 ms instead of 4.7.
 
-## Next
+## Next (start here; state at the end of 22 Nov 2026)
 
-- GPU: the race is GPU-bound. The 7900 XTX runs at its board power limit there (~361 W, ~3,050 MHz, 99-100% busy;
-  `work\bench\gpusensors.py`, logged by `fm4bench.ps1`). Where the GPU time goes on the 1440p 4x grid (ReGPU
-  `REGPU_EXP_DRAW`, live):
+**The race is CPU-bound now, and the limit is ReGPU's draw thread.** At 720p 1x (the CPU ceiling, 304 fps, 1% low
+202) the draw thread is busy 98% of the time (median; p10 92%, p90 100%, over 60 s). The GPU reaches 307 fps at
+1440p 4x, so making the draw thread faster raises race fps directly, until the GPU or the game's main thread (guest 3)
+takes over. The GPU side is parked: see "GPU (parked)" below for what was measured.
+
+What the data says about the draw thread (last caller-level profile, 720p grid, taken **before** ReGPU e30f7cb and FM4
+477a996, so stale):
+
+| Where | Share | What |
+|---|---|---|
+| DrawImpl self time | 17% | per-draw state handling; needs a line-level look |
+| Hashing guest data | ~8% | UploadGuest full hash of small uploads 4.4%, index buffer hash 1.9%, CachedIndexList 1.7% |
+| GetIndexBuffer | 4.3% | |
+| GetPipeline + MakePipelineKey | ~5% | |
+| Road write-back (WriteHalfRows etc.) | ~3.4% | half-float conversion and tiling, on the draw thread |
+| Shader-load memcmp | 2.3% | |
+| memcpy | ~4% | |
+| WindowScissor, textures, shader lookups | ~1% each | |
+
+The renderer's timers at 1440p split the draw thread's ~4 ms/frame into constants 1.13 ms (vertex fetch setup 0.38),
+"submit" 1.15, pipelines 0.64, textures 0.33, indices 0.30, shaders 0.16. `REGPU_FETCH_SPECIALIZE` (default) adds
+per-draw spec hashing (RegisterSpec): check its CPU cost in the new profile.
+
+The plan, in order (agreed with the user as the proposal; nothing started):
+1. **Fresh draw-thread profile of the race at 720p** (`FM2_SAMPLE_THREAD=w FM2_SAMPLE_CALLERS=1`, plus line numbers
+   inside DrawImpl). Rank everything below from it. ~15 min.
+2. **Draw workers** (`REGPU_DRAW_WORKERS`, existing switch): no gain in FM3, but FM3's limit was elsewhere. Here the
+   draw thread is the limit, so this could be the biggest single win if FM4's draws allow it. Quick to test.
+3. **What "submit" (1.15 ms/frame) is.** If it is command recording on the draw thread, a leaner recorder helps every draw.
+4. **Road write-back off the draw thread** (background thread), ~3%.
+5. **Targeted cuts from the profile:** remaining hashing, index and pipeline lookups, DrawImpl hot spots.
+
+Expected: 3-5 maybe 10-20% of the draw thread; 2 is the unknown. Measure: `fm4grid.ps1` (720p grid, median fps) and
+live A/B with `tools/perf/ab.py ab <SWITCH> 5 4 switch`; confirm with `fm4bench.ps1` races at 720p (alternated boots, an idle
+PC). Ask the user before multi-day work (a parallel recorder, draw reordering).
+
+### GPU (parked)
+
+- The race at 1440p 4x reached the CPU ceiling with `REGPU_FETCH_SPECIALIZE` (307 vs 304 fps). The XTX runs at its
+  board power limit there (~361 W, ~3,050 MHz, 99-100% busy; `work\bench\gpusensors.py`, logged by `fm4bench.ps1`).
+  Where the GPU time goes on the 1440p 4x grid (ReGPU `REGPU_EXP_DRAW`, live):
 
   | mode | GPU ms |
   |---|---|
@@ -176,16 +214,16 @@ Scripts in `ReGPU-V\work\bench`:
 
   A draw call costs ~20 ns. A draw right after a pipeline switch costs ~0.9 us against ~0.24 us: the switches are ~0.78 ms
   of the 3.1. Pixel shading is ~1 ms. Switches that change the vertex shader cost more than pixel-shader-only ones.
-  The translated shaders are large (`REGPU_SHADER_STATS=1`, 1,184 pipelines; disassembly bytes): vertex shaders median
-  77 KB, p90 134 KB; pixel shaders median 85 KB, p90 267 KB, max 1 MB. A sample vertex shader is ~1,300 instructions,
-  mostly `v_cndmask`/`v_cmp` (predication as selects), with SGPR spills into VGPR lanes; 114 vertex shaders use scratch.
-  The pipelines are monolithic and fully optimised (pipeline libraries are off). Leads: smaller translated shaders
-  (branches instead of selects for predicated blocks), or an RGP capture (`work\tools\RadeonDeveloperToolSuite-*`,
-  `RadeonDeveloperPanelCLI.exe -m profiling`), read in the RGP GUI.
-- Bench noise: on some boots the same frame took the GPU 1.3x longer (clocks or power, not other programs). Compare
-  races at the same "GPU while 90%+ busy" clock that `fm4bench.ps1` prints.
-- CPU: the game's main thread (guest 3) runs at about 100% in races (game code).
-- Write-backs: they are still written on the draw thread at the frame-slot reuse. They could move to the background.
+- Tried with no GPU gain on the XTX (all behind switches, off): `REGPU_VS_SPECIALIZE` (lost in races),
+  `REGPU_SPIRV_FINITE_MUL`, `REGPU_BARRIER_MERGE` / `REGPU_READBACK_BARRIER_DEFER`, `REGPU_EXP_COLOR_FORMAT`,
+  DRAW_CULL. The remaining XTX levers: draw reordering to cut pipeline switches (days, risky for blending order) or
+  uniform vertex export counts (~0.1 ms). For the Deck (little bandwidth, few CUs) try `REGPU_EXP_COLOR_FORMAT`,
+  `REGPU_SPIRV_FINITE_MUL`, `REGPU_BARRIER_MERGE` there.
+- Bench noise: on some boots the same frame took the GPU 1.3x longer (clocks or power). Compare races at the same
+  "GPU while 90%+ busy" clock that `fm4bench.ps1` prints.
+
+### Smaller open items
+
 - `REGPU_COPIES_1010102_BIASED=1` (only biased 10-bit copies, never the front buffer) works but gives +0.3%: left off.
 - `REGPU_COPIES_1010102` breaks FM4's front buffer (a `k_2_10_10_10` resolve becomes a 10-bit image the presenter
   doesn't take). The presenter would need to accept it.
