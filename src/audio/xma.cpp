@@ -179,6 +179,135 @@ void SetRegister(uint32_t r, uint32_t value)
     *GuestPtr<uint32_t>(kApuBase + r * 4) = value;
 }
 
+// ---- Codec reuse (on by default; FM2_XMA_REUSE=0 turns it off, start time). From the FM3 port's Steam Deck work.
+// Every stream restart takes a fresh FFmpeg codec (Reset, below) and the old one is freed. In a race that is ~160
+// codecs a second (engine sounds restart all the time), and an XMA2 codec is ~8 MB of allocations, zeroed: on a Steam
+// Deck under Proton the decoder thread spent ~40% of a core in the heap, page faults and memset for it (FFmpeg's
+// decoding itself was ~1%), and on a power-limited APU CPU power is GPU clock; elsewhere it is a core's worth of heap traffic. With reuse a retired codec is put
+// back to the state it had when it was opened instead: FFmpeg's flush (its internal packet state, the XMA sample
+// FIFOs, the stream flags), then the codec's private context copied back from a snapshot taken right after
+// avcodec_open2, and the per-stream frames emptied. The private context is one allocation of the decoder's
+// priv_data_size, read from libavcodec's FFCodec (codec_internal.h, 8.x: right after the public AVCodec and one
+// 32-bit word of bit fields). The XMA context's layout is checked on the first snapshot (num_streams 1, frames[0]
+// set and the other seven empty, at their place 256 bytes before the end); if that doesn't hold, reuse stays off.
+// FM2_XMA_REUSE_VERIFY=1: every reused codec is shadowed by a freshly opened one fed the same packets, and their
+// samples compared (logged: "xma reuse verify"); the check that it is exact.
+bool XmaReuse()
+{
+    static const bool on = [] {
+        const char* v = getenv("FM2_XMA_REUSE");
+        return !v || !*v || strcmp(v, "0") != 0; // (on unless =0)
+    }();
+    return on;
+}
+bool XmaReuseVerify()
+{
+    static const bool on = XmaReuse() && getenv("FM2_XMA_REUSE_VERIFY") && strcmp(getenv("FM2_XMA_REUSE_VERIFY"), "0") != 0;
+    return on;
+}
+std::mutex g_pristineMutex;
+std::map<AVCodecContext*, std::vector<uint8_t>> g_pristine; // codec -> its private context right after opening
+std::set<AVCodecContext*> g_recycled;                       // codecs reset in place at least once (for the verify mode)
+std::atomic<bool> g_reuseBroken{ false };
+std::atomic<uint64_t> g_codecsRecycled{ 0 };
+constexpr size_t kXmaTail = 256; // XMADecodeCtx after xma[8]: frames[8], current/num_streams, samples[2][8], start_channel[8], trims, flushed (padded to 32)
+
+size_t PrivDataSize(const AVCodecContext* av)
+{
+    int size = 0;
+    memcpy(&size, reinterpret_cast<const uint8_t*>(av->codec) + sizeof(AVCodec) + sizeof(unsigned), sizeof(size));
+    // (xma[8] of a 32-byte aligned WMAProDecodeCtx, then the tail: RecycleCodec restores xma[0] and the tail only.)
+    return size >= int(kXmaTail + 4096) && size <= (64 << 20) && size % 32 == 0 && (size - kXmaTail) % (8 * 32) == 0 ? size_t(size) : 0;
+}
+
+AVFrame** XmaFrames(AVCodecContext* av, size_t size)
+{
+    return reinterpret_cast<AVFrame**>(static_cast<uint8_t*>(av->priv_data) + size - kXmaTail);
+}
+
+void SnapshotCodec(AVCodecContext* av)
+{
+    if (!XmaReuse() || g_reuseBroken)
+        return;
+    const size_t size = PrivDataSize(av);
+    bool ok = size != 0;
+    if (ok)
+    {
+        AVFrame** frames = XmaFrames(av, size);
+        int current = -1, streams = -1;
+        memcpy(&current, frames + 8, sizeof(int));
+        memcpy(&streams, reinterpret_cast<const uint8_t*>(frames + 8) + sizeof(int), sizeof(int));
+        ok = frames[0] && current == 0 && streams == 1;
+        for (int i = 1; i < 8 && ok; i++)
+            ok = frames[i] == nullptr;
+    }
+    if (!ok)
+    {
+        if (!g_reuseBroken.exchange(true))
+            Log("xma: codec reuse off: this FFmpeg's XMA context isn't laid out as expected (private size %zu)", size);
+        return;
+    }
+    std::vector<uint8_t> bytes(static_cast<const uint8_t*>(av->priv_data), static_cast<const uint8_t*>(av->priv_data) + size);
+    static std::atomic<bool> logged{ false };
+    if (!logged.exchange(true))
+        Log("xma: codec reuse on: retired codecs are reset in place (private context %zu KB)", size >> 10);
+    std::lock_guard lock(g_pristineMutex);
+    g_pristine[av] = std::move(bytes);
+}
+
+void FreeCodec(AVCodecContext* av)
+{
+    if (!av)
+        return;
+    {
+        std::lock_guard lock(g_pristineMutex);
+        g_pristine.erase(av);
+        g_recycled.erase(av);
+    }
+    avcodec_free_context(&av);
+}
+
+// A retired codec back to its just-opened state (see above). False: free it instead.
+bool RecycleCodec(AVCodecContext* av)
+{
+    if (!XmaReuse() || g_reuseBroken)
+        return false;
+    const std::vector<uint8_t>* snapshot = nullptr;
+    {
+        std::lock_guard lock(g_pristineMutex);
+        if (auto it = g_pristine.find(av); it != g_pristine.end())
+            snapshot = &it->second; // (only this thread erases entries: FreeCodec runs on the decoder thread too)
+    }
+    if (!snapshot)
+        return false;
+    avcodec_flush_buffers(av);
+    // Only what decoding a one-stream codec writes: stream 0's context (xma[0], an eighth of what is before the tail;
+    // FFmpeg's XMA decoder reads, flushes and decodes only streams below num_streams = 1) and the tail (frames, FIFO
+    // pointers, current stream, trims, flushed). The other seven stay as opened. Copying the whole 3.6 MB was ~70% of
+    // the decoder thread's time.
+    const size_t size = snapshot->size(), stream = (size - kXmaTail) / 8;
+    auto* priv = static_cast<uint8_t*>(av->priv_data);
+    memcpy(priv, snapshot->data(), stream);
+    memcpy(priv + size - kXmaTail, snapshot->data() + size - kXmaTail, kXmaTail);
+    AVFrame** frames = XmaFrames(av, size);
+    for (int i = 0; i < 8; i++)
+        if (frames[i])
+            av_frame_unref(frames[i]);
+    g_codecsRecycled++;
+    if (XmaReuseVerify())
+    {
+        std::lock_guard lock(g_pristineMutex);
+        g_recycled.insert(av);
+    }
+    return true;
+}
+
+bool WasRecycled(AVCodecContext* av)
+{
+    std::lock_guard lock(g_pristineMutex);
+    return g_recycled.count(av) != 0;
+}
+
 AVCodecContext* OpenCodec(uint32_t ch, uint32_t hz)
 {
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
@@ -194,6 +323,8 @@ AVCodecContext* OpenCodec(uint32_t ch, uint32_t hz)
     av->extradata[0] = 1;
     if (avcodec_open2(av, codec, nullptr) < 0)
         avcodec_free_context(&av);
+    if (av)
+        SnapshotCodec(av);
     return av;
 }
 
@@ -257,7 +388,7 @@ void RetireCodec(AVCodecContext* av)
     if (!av)
         return;
     if (NoCodecPool())
-        return avcodec_free_context(&av);
+        return FreeCodec(av);
     std::lock_guard lock(g_poolMutex);
     g_retiredCodecs.push_back(av);
 }
@@ -272,6 +403,31 @@ void RefillCodecPool()
     {
         std::lock_guard lock(g_poolMutex);
         retired.swap(g_retiredCodecs);
+    }
+    // FM2_XMA_REUSE: retired codecs reset in place go back to their format's spares (up to the most kept a format,
+    // MaxPooledCodecs); the rest are freed.
+    std::vector<AVCodecContext*> surplus;
+    if (XmaReuse())
+    {
+        std::vector<std::pair<std::pair<uint32_t, uint32_t>, AVCodecContext*>> recycled;
+        for (AVCodecContext*& av : retired)
+            if (av && RecycleCodec(av))
+            {
+                recycled.push_back({ { uint32_t(av->ch_layout.nb_channels), uint32_t(av->sample_rate) }, av });
+                av = nullptr;
+            }
+        std::lock_guard lock(g_poolMutex);
+        for (const auto& [key, av] : recycled)
+        {
+            auto& pool = g_codecPool[key];
+            if (pool.size() < kMaxPooledCodecs)
+                pool.push_back(av);
+            else
+                surplus.push_back(av);
+        }
+    }
+    {
+        std::lock_guard lock(g_poolMutex);
         for (const auto& [key, pool] : g_codecPool)
         {
             size_t& target = g_codecTarget[key];
@@ -287,7 +443,9 @@ void RefillCodecPool()
         g_codecsWanted.clear();
     }
     for (AVCodecContext* av : retired)
-        avcodec_free_context(&av);
+        FreeCodec(av);
+    for (AVCodecContext* av : surplus)
+        FreeCodec(av);
     for (const auto& key : wanted)
         if (AVCodecContext* av = OpenCodec(key.first, key.second))
         {
@@ -402,6 +560,9 @@ int SpillBits(const uint8_t* p)
 struct Decoder
 {
     AVCodecContext* av = nullptr;
+    // FM2_XMA_REUSE_VERIFY: a fresh codec fed the same packets as a reused `av` (nullptr: not checking this one).
+    AVCodecContext* shadow = nullptr;
+    AVFrame* shadowFrame = nullptr;
     AVPacket* packet = nullptr;
     AVFrame* frame = nullptr;
     uint32_t channels = 0, rate = 0;
@@ -445,6 +606,9 @@ struct Decoder
 
     void Close()
     {
+        FreeCodec(shadow);
+        shadow = nullptr;
+        av_frame_free(&shadowFrame);
         RetireCodec(av);
         av = nullptr;
         av_packet_free(&packet);
@@ -458,6 +622,7 @@ struct Decoder
         RetireCodec(av);
         if (!(av = TakeCodec(ch, hz)))
             return false;
+        StartShadow(ch, hz);
         if (!packet)
             packet = av_packet_alloc();
         if (!frame)
@@ -485,6 +650,7 @@ struct Decoder
         RetireCodec(av);
         if (!(av = TakeCodec(channels, rate)))
             return false;
+        StartShadow(channels, rate);
         used = holdsTail = false;
         flush = false;
         lastBuffer = -1;
@@ -494,6 +660,69 @@ struct Decoder
         return true;
     }
 
+    // FM2_XMA_REUSE_VERIFY: a reused codec gets a freshly opened twin (OpenCodec, outside the pool).
+    void StartShadow(uint32_t ch, uint32_t hz)
+    {
+        FreeCodec(shadow);
+        shadow = nullptr;
+        if (!XmaReuseVerify() || !WasRecycled(av))
+            return;
+        shadow = OpenCodec(ch, hz);
+        if (!shadowFrame)
+            shadowFrame = av_frame_alloc();
+    }
+
+    // FM2_XMA_REUSE_VERIFY: the same packet (nullptr: the drain) through the shadow, its samples compared with what
+    // `av` appended to pcm from pcmBefore (before BlendFade).
+    void CheckShadow(const uint8_t* data, size_t pcmBefore, int sentMain)
+    {
+        if (!shadow)
+            return;
+        static std::atomic<uint64_t> compared{ 0 }, differ{ 0 };
+        int sent;
+        if (data)
+        {
+            AVPacket* pk = av_packet_alloc();
+            if (av_new_packet(pk, kPacketBytes) < 0)
+            {
+                av_packet_free(&pk);
+                return;
+            }
+            memcpy(pk->data, data, kPacketBytes);
+            sent = avcodec_send_packet(shadow, pk);
+            av_packet_free(&pk);
+        }
+        else
+            sent = avcodec_send_packet(shadow, nullptr);
+        std::vector<int16_t> out;
+        while (sent >= 0 && avcodec_receive_frame(shadow, shadowFrame) == 0)
+        {
+            const int n = shadowFrame->nb_samples, ch = std::min<int>(shadowFrame->ch_layout.nb_channels, int(channels));
+            const size_t base = out.size();
+            out.resize(base + size_t(n) * channels);
+            for (int c = 0; c < int(channels); c++)
+            {
+                const float* in = reinterpret_cast<const float*>(shadowFrame->extended_data[std::min(c, ch - 1)]);
+                for (int i = 0; i < n; i++)
+                    out[base + size_t(i) * channels + c] = int16_t(std::clamp(in[i], -1.0f, 1.0f) * 32767.0f);
+            }
+            av_frame_unref(shadowFrame);
+        }
+        const size_t got = pcm.size() - pcmBefore;
+        const bool same = (sent < 0) == (sentMain < 0) && got == out.size() && (got == 0 || memcmp(pcm.data() + pcmBefore, out.data(), got * sizeof(int16_t)) == 0);
+        const uint64_t c = ++compared;
+        if (!same)
+        {
+            const uint64_t d = ++differ;
+            if (d <= 20)
+                Log("xma reuse verify: DIFFERENT %s (%zu vs %zu samples, send %d vs %d), %llu of %llu packets differ so far", data ? "packet" : "drain", got,
+                    out.size(), sentMain, sent, (unsigned long long)d, (unsigned long long)c);
+        }
+        if (c % 5000 == 0)
+            Log("xma reuse verify: %llu packets of reused codecs compared with fresh ones, %llu differ (%llu codecs reused)", (unsigned long long)c,
+                (unsigned long long)differ.load(), (unsigned long long)g_codecsRecycled.load());
+    }
+
     // The end of a stream: the codec holds back about a packet of audio until more input
     // comes. Appends it (and silence up to a whole output block) and resets the codec.
     void Drain(size_t block)
@@ -501,7 +730,7 @@ struct Decoder
         if (!av)
             return;
         const size_t pcmBefore = pcm.size();
-        avcodec_send_packet(av, nullptr);
+        const int sentDrain = avcodec_send_packet(av, nullptr);
         while (avcodec_receive_frame(av, frame) == 0)
         {
             const int n = frame->nb_samples, ch = std::min<int>(frame->ch_layout.nb_channels, int(channels));
@@ -515,6 +744,7 @@ struct Decoder
             }
             av_frame_unref(frame);
         }
+        CheckShadow(nullptr, pcmBefore, sentDrain);
         framesDecoded += (pcm.size() - pcmBefore) / channels;
         if (const size_t rest = (pcm.size() - pcmRead) % block)
             pcm.resize(pcm.size() + (block - rest), 0);
@@ -565,7 +795,11 @@ struct Decoder
         if (flush)
         {
             if (used)
+            {
                 avcodec_flush_buffers(av); // (Reset replaces the codec before this unless FM2_XMA_FLUSH_ONLY)
+                if (shadow)
+                    avcodec_flush_buffers(shadow);
+            }
             flush = false;
         }
         used = true;
@@ -578,6 +812,7 @@ struct Decoder
         av_packet_unref(packet);
         if (sent < 0)
         {
+            CheckShadow(data, pcm.size(), sent);
             CAP_EVENT(info.ctx, "packet_failed", "hdr=%08X;hash=%016llX;buf=%08X;bi=%u;pkt=%u;off=%u", uint32_t(data[0]) << 24 | uint32_t(data[1]) << 16 | uint32_t(data[2]) << 8 | data[3],
                       (unsigned long long)(audiocap::On() ? CapHash(data, kPacketBytes) : 0), info.bufferAddr, info.bufferIndex, info.packetIndex, info.readOffset);
             noteErrors();
@@ -600,6 +835,7 @@ struct Decoder
             }
             av_frame_unref(frame);
         }
+        CheckShadow(data, pcmBefore, sent);
         const bool hadMessage = t_errorSeen;
         noteErrors();
         const bool failed = received != AVERROR(EAGAIN) && received != AVERROR_EOF;

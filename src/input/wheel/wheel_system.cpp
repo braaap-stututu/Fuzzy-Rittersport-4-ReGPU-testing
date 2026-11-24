@@ -188,14 +188,27 @@ struct System::Impl
         wc.lpszClassName = L"fm4-wheel-input";
         RegisterClassW(&wc);
         hwnd = CreateWindowExW(0, wc.lpszClassName, L"fm4 wheel input", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
-        if (FAILED(DirectInput8Create(GetModuleHandleW(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8W, (void**)&di, nullptr)))
-        {
-            Log("Wheel: DirectInput is not available: no wheel support");
-            di = nullptr;
-        }
+        // DirectInput only while wheels are read (wheel_mode auto or on; made when the mode leaves off). With it, every
+        // device it opens is acquired, and Wine's input threads take each of its reports through the wineserver: on a
+        // Steam Deck the built-in controller and Steam's virtual pad were opened with the mode off, ~4,900 reports a
+        // second, the wineserver at ~23% of a core.
+        bool diFailed = false;
         for (;;)
         {
-            if (di)
+            bool off;
+            {
+                std::lock_guard l(mutex);
+                off = cfg.mode == "off";
+            }
+            if (off)
+                ReleaseAll();
+            else if (!di && !diFailed && FAILED(DirectInput8Create(GetModuleHandleW(nullptr), DIRECTINPUT_VERSION, IID_IDirectInput8W, (void**)&di, nullptr)))
+            {
+                Log("Wheel: DirectInput is not available: no wheel support");
+                di = nullptr;
+                diFailed = true;
+            }
+            if (di && !off)
                 Scan();
             {
                 std::lock_guard l(startMutex);
@@ -222,6 +235,26 @@ struct System::Impl
         return DIENUM_CONTINUE;
     }
 
+    // Every opened device closed (wheel_mode set to off while running).
+    void ReleaseAll()
+    {
+        std::lock_guard l(mutex);
+        if (devs.empty())
+            return;
+        for (auto& d : devs)
+        {
+            states.erase(d->serial);
+            if (d->di)
+            {
+                d->di->Unacquire();
+                d->di->Release();
+            }
+        }
+        devs.clear();
+        listSerial++;
+        Recompute();
+    }
+
     void Scan()
     {
         std::vector<Found> found;
@@ -241,6 +274,11 @@ struct System::Impl
                 // XInput pads (Microsoft's) stay with the gamepad path.
                 const bool pidvid = memcmp(&f.product.Data4[2], "PIDVID", 6) == 0;
                 if (pidvid && LOWORD(f.product.Data1) == 0x045E)
+                    continue;
+                // Gamepads (Steam's virtual pad, a Steam Deck's controller, PlayStation and Switch pads) play through
+                // XInput and are never wheels in auto mode (WheelLike): not opened, so DirectInput doesn't take their
+                // reports. wheel_mode = on still opens them (a wheel that says it is a gamepad).
+                if (GET_DIDEVICE_TYPE(f.type) == DI8DEVTYPE_GAMEPAD && cfg.mode != "on")
                     continue;
                 auto d = std::make_unique<Dev>();
                 d->instance = f.instance;

@@ -11,6 +11,7 @@
 //   2 / unset  sleep ~100 us on a high-resolution waitable timer after each such round (gives the core back)
 // The answer (r3) and everything the round does are the game's; only the time between rounds changes.
 // FM3 measured mode 2: -17-19% CPU, same fps and frame times.
+#include <regpu/wine_wait.h>
 #include <windows.h>
 
 #include <atomic>
@@ -44,6 +45,9 @@ int Mode()
 
 void ShortSleep()
 {
+    // REGPU_WINE_WAITS (set under Wine: src/lowend.cpp): a nanosleep instead of a wineserver timer.
+    if (regpu::winewait::On())
+        return regpu::winewait::SleepUs(100);
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer)
     {

@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "deck.h"
 #include "kernel/imports.h"
 #include "kernel/thread.h"
 #include "loader.h"
@@ -103,6 +104,7 @@ void RuntimeInit(const std::filesystem::path& gameDir)
     std::filesystem::create_directories(g_contentDir, ec);
     std::filesystem::create_directories(DlcDir(), ec);
     Log("runtime: profile %s, saves in %s", GetSettings().profile.c_str(), g_contentDir.string().c_str());
+    DeckProfileInit(); // (the Steam Deck profile: before the GPU starts, which reads its defaults)
     GpuStart();
     AudioInit();
 }

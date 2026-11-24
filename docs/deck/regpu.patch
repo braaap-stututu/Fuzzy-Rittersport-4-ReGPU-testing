@@ -1,0 +1,326 @@
+diff --git a/include/regpu/wine_wait.h b/include/regpu/wine_wait.h
+new file mode 100644
+index 0000000..f3021f8
+--- /dev/null
++++ b/include/regpu/wine_wait.h
+@@ -0,0 +1,85 @@
++#pragma once
++// Short waits that stay out of Wine's wineserver: on by default under Wine (REGPU_WINE_WAITS=0 turns it off; never on
++// outside Wine). Read at each wait until it is seen on, then on for good.
++//
++// Under Wine a waitable timer is a wineserver object: every SetWaitableTimer plus its wait is a round trip to the
++// server process. ReGPU's vblank ticks (twice the frame cap: 720 Hz at a 360 cap), the command processor's idle
++// sleeps, the frame limiter and a port's short sleeps all use high-resolution timers, so the server process becomes a
++// busy thread of its own (FM3 on a Steam Deck under Proton: wineserver at 24% of a core in a race). With this switch:
++//   - a sleep is NtDelayExecution, not alertable: in Wine that is a nanosleep in the calling thread;
++//   - "an event or a timeout" is NtWaitForSingleObject with a relative timeout: with ntsync (Proton 10+, Linux 6.14+)
++//     one ioctl with a nanosecond timeout, no server.
++// Both measured on the Deck (Proton 11): a 100 us sleep took 169 us against the timer's 203 us. On Windows these
++// calls round to the system timer resolution (0.5-1 ms), which is why it is a Wine-only switch: without Wine
++// (no wine_get_version in ntdll) it stays off even when set.
++#include <windows.h>
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++namespace regpu::winewait
++{
++using NtDelayExecutionFn = LONG(NTAPI*)(BOOLEAN alertable, PLARGE_INTEGER interval);
++using NtWaitForSingleObjectFn = LONG(NTAPI*)(HANDLE handle, BOOLEAN alertable, PLARGE_INTEGER timeout);
++
++struct Api
++{
++    bool wine = false;
++    NtDelayExecutionFn delay = nullptr;
++    NtWaitForSingleObjectFn wait = nullptr;
++};
++
++inline const Api& Get()
++{
++    static const Api api = [] {
++        Api a;
++        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++        if (!ntdll || !GetProcAddress(ntdll, "wine_get_version"))
++            return a;
++        a.delay = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
++        a.wait = reinterpret_cast<NtWaitForSingleObjectFn>(GetProcAddress(ntdll, "NtWaitForSingleObject"));
++        a.wine = a.delay && a.wait;
++        return a;
++    }();
++    return api;
++}
++
++// REGPU_WINE_WAITS is set, this is Wine, and the ntdll calls exist. The variable is read at every call (a getenv
++// is nothing next to the wait), so a port may set it after the first waits: threads that waited before a port's
++// start-up code ran kept the timer path for good when it was read once.
++inline bool On()
++{
++    if (!Get().wine)
++        return false;
++    // Once seen on it stays on (a getenv per wait was ~2% of a thread that waits often: the CRT scans the whole
++    // environment each time).
++    static std::atomic<bool> seen{ false };
++    if (seen.load(std::memory_order_relaxed))
++        return true;
++    // Unset: on (under Wine; measured on a Steam Deck, Proton 11). =0: the waitable timers.
++    const char* v = getenv("REGPU_WINE_WAITS");
++    const bool on = !v || !*v || strcmp(v, "0") != 0;
++    if (on)
++        seen.store(true, std::memory_order_relaxed);
++    return on;
++}
++
++// Sleeps about `us` microseconds (only when On()).
++inline void SleepUs(int64_t us)
++{
++    LARGE_INTEGER interval;
++    interval.QuadPart = -(us > 0 ? us : 0) * 10; // relative, 100 ns units
++    Get().delay(FALSE, &interval);
++}
++
++// Waits for `handle` at most `us` microseconds (only when On()): WAIT_OBJECT_0 when it was signalled, else
++// WAIT_TIMEOUT.
++inline DWORD WaitUs(HANDLE handle, int64_t us)
++{
++    LARGE_INTEGER timeout;
++    timeout.QuadPart = -(us > 0 ? us : 0) * 10;
++    return Get().wait(handle, FALSE, &timeout) == 0 ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
++}
++} // namespace regpu::winewait
+diff --git a/src/gpu/gpu.cpp b/src/gpu/gpu.cpp
+index e6ded1d..6d7e9bc 100644
+--- a/src/gpu/gpu.cpp
++++ b/src/gpu/gpu.cpp
+@@ -3,6 +3,7 @@
+ // (memory writes, fences, interrupts, waits) and skips everything that would
+ // draw. Vblank interrupts run at 60 Hz. Phase 2 replaces drawing with a
+ // native renderer hooked at the D3D level.
++#include <regpu/wine_wait.h>
+ #include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+@@ -2196,7 +2197,9 @@ void CommandProcessorLoop(PPCContext& ctx)
+                     Log("gpu: command processor idle wait: %s%d us", us > 0 ? "sleeps after " : "spins (", us > 0 ? us : 0);
+                 sleepAfterUs = us;
+             }
+-            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
++            if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs) && regpu::winewait::On())
++                regpu::winewait::SleepUs(100); // REGPU_WINE_WAITS: no wineserver timer (regpu/wine_wait.h)
++            else if (sleepAfterUs > 0 && now - emptySince >= std::chrono::microseconds(sleepAfterUs))
+             {
+                 thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                 LARGE_INTEGER due;
+@@ -2313,7 +2316,14 @@ void VblankLoop()
+             // next tick is a full period away. (No spinning: the kicks set the pace when it matters.)
+             thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+             const auto left = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+-            if (left > 0)
++            // REGPU_WINE_WAITS (Wine): the kick event with a timeout, one ntsync wait instead of a wineserver timer
++            // per tick (regpu/wine_wait.h).
++            if (left > 0 && regpu::winewait::On())
++            {
++                if (regpu::winewait::WaitUs(VblankKickEvent(), left) == WAIT_OBJECT_0)
++                    next = Clock::now();
++            }
++            else if (left > 0)
+             {
+                 LARGE_INTEGER due;
+                 due.QuadPart = -int64_t(left) * 10;
+diff --git a/src/gpu/renderer.cpp b/src/gpu/renderer.cpp
+index 8372163..71cb0d8 100644
+--- a/src/gpu/renderer.cpp
++++ b/src/gpu/renderer.cpp
+@@ -896,6 +896,10 @@ struct CachedTexture
+     uint32_t width = 0, height = 0;
+     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM; // cubes: matches their faces
+     bool native = false; // block-compressed on the GPU: the shader applies the fetch swizzle
++    // Write watch (Host::watchArm / watchClean; REGPU_TEXTURE_NO_WATCH): armed since watchSeq, not before watchQuietUntil.
++    bool watchArmed = false;
++    uint8_t watchFalseWrites = 0;
++    uint64_t watchSeq = 0, watchQuietUntil = 0;
+     // The texture budget's size of `resource` (its allocation's, asked once per resource: TextureBudgetBytes).
+     const vk::Image* budgetFor = nullptr;
+     uint64_t budgetBytes = 0;
+@@ -2993,8 +2997,16 @@ Renderer::Surface& GetSurface(bool depth, uint32_t base)
+     // Multisampled colour surfaces stay in GENERAL for drawing, resolving (sampled) and copying: each resolve moved the
+     // surface out of the attachment layout and back, and AMD's Vulkan drivers decompressed the whole surface each time
+     // (FM3 on a Ryzen 9800X3D's graphics at 720p 2x: ~0.84 ms a resolve, the frame 2.7x D3D12's; D3D12's driver reads
+-    // the compressed samples). REGPU_VK_NO_MSAA_GENERAL=1 (start-time): the optimal layouts, as before.
+-    static const bool noGeneral = getenv("REGPU_VK_NO_MSAA_GENERAL") && strcmp(getenv("REGPU_VK_NO_MSAA_GENERAL"), "0") != 0;
++    // the compressed samples). Mesa's RADV is the other way round: it resolves from the optimal layouts without a
++    // decompression and in GENERAL it can't fast-clear (FM3 on a Steam Deck: the main scene's clear after each resolve
++    // 0.66 ms in GENERAL against 0.23 ms, the race +4.3%), so on RADV they stay in the optimal layouts.
++    // REGPU_VK_NO_MSAA_GENERAL=1 / =0 (start-time) forces the optimal layouts / GENERAL on any driver.
++    static const bool noGeneral = [] {
++        const char* v = getenv("REGPU_VK_NO_MSAA_GENERAL");
++        if (v && *v)
++            return strcmp(v, "0") != 0;
++        return g_r.vkd->driver.driverID == VK_DRIVER_ID_MESA_RADV;
++    }();
+     s.vk.general = !depth && desc.samples > VK_SAMPLE_COUNT_1_BIT && !noGeneral;
+     CountCreate(depth ? "depth surface" : "colour surface");
+     // Starts as a target, as D3D12's did (created in RENDER_TARGET / DEPTH_WRITE), in order with the recorded commands.
+@@ -8583,6 +8595,38 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+     LiveSwitch &stagger = g_sw_REGPU_TEXTURE_CHECK_STAGGER;
+     const bool checkAlways = !stagger;
+     const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
++    // Write watch (Host::watchArm / watchClean, as the index buffers and the vertex arena): a texture none of whose
++    // pages was written since its last hash is unchanged, known without reading it, so it is checked at every frame
++    // for nothing (no stagger delay for it, no hashing ahead). Textures were hashed at their checks, staggered or not,
++    // most of them ahead on three worker threads: on a Steam Deck's frozen FM4 grid ~0.5 of a core, every frame. One
++    // that changes is hashed for 120 frames before it is watched again (a fault per write otherwise); one whose pages
++    // are written without its contents changing (data the title rewrites next to it) twice in a row is left alone
++    // for 1200 frames; memory that can't be watched is tried again after 600. REGPU_TEXTURE_NO_WATCH=1 (live): hashed
++    // as before. REGPU_TEXTURE_WATCH_VERIFY=1 (diagnostic): hashed anyway, and a change with no write seen is logged.
++    static LiveSwitch noTextureWatch("REGPU_TEXTURE_NO_WATCH");
++    static LiveSwitch textureWatchVerify("REGPU_TEXTURE_WATCH_VERIFY");
++    const regpu::Host& host = regpu::GetHost();
++    const bool textureWatch = host.watchArm && host.watchClean && host.watchSeq && !noTextureWatch && !forceDecode;
++    const uint32_t texturePhysical = fetch.Address() & 0x1FFFFFFF;
++    bool watchedClean = false; // (verify mode: clean by the watch, hashed anyway below)
++    if (textureWatch && cached.resource && cached.watchArmed)
++    {
++        const uint8_t* source;
++        size_t bytes, stride;
++        TextureHashSpan(fetch, w, h, source, bytes, stride);
++        if (host.watchClean(texturePhysical, uint32_t(bytes), cached.watchSeq))
++        {
++            watchedClean = true;
++            if (!textureWatchVerify)
++            {
++                cached.checkedFrame = g_r.frame;
++                cached.unchanged++;
++                format = cached.format;
++                native = cached.native;
++                return cached.resource.Get();
++            }
++        }
++    }
+     // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
+     // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
+     LiveSwitch &every4 = g_sw_REGPU_TEXTURE_CHECK_EVERY4;
+@@ -8591,7 +8635,7 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+     // long enough to be, each on its own frames, and when it played again its brightness and colour came
+     // from different frames for a frame or two (FM2 port, report #15). REGPU_STAGGER_CHANGING=1: as before.
+     static LiveSwitch noChangingCheck("REGPU_STAGGER_CHANGING");
+-    if (cached.resource && !checkAlways && !forceDecode && cached.unchanged >= 30 &&
++    if (cached.resource && !checkAlways && !forceDecode && !watchedClean && cached.unchanged >= 30 &&
+         (cached.changes < 8 || noChangingCheck) && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
+     {
+         if (((g_r.frame + 1 + (textureKey >> 32)) & checkMask) == 0) // due next frame: hashed ahead
+@@ -8617,8 +8661,42 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+     const uint8_t* source;
+     size_t sourceBytes, hashStride;
+     TextureHashSpan(fetch, w, h, source, sourceBytes, hashStride);
++    const bool watchWritten = cached.watchArmed && !watchedClean; // (armed, and a write was seen)
++    if (textureWatch && !watchedClean)
++    {
++        cached.watchArmed = false;
++        if (g_r.frame >= cached.watchQuietUntil)
++        {
++            cached.watchSeq = host.watchSeq() + 1; // (armed before the hash: a write after it faults and is seen)
++            cached.watchArmed = host.watchArm(texturePhysical, uint32_t(sourceBytes));
++            if (!cached.watchArmed)
++                cached.watchQuietUntil = g_r.frame + 600;
++        }
++    }
+     const uint64_t hash = prehash::Hash(textureKey, source, sourceBytes, hashStride) ^ (bc ? 0 : uint64_t(fetch.Swizzle()) << 8) ^ (uint64_t(fetch.Pitch()) << 24) ^
+         (uint64_t(fetch.Tiled()) << 40) ^ (uint64_t(fetch.Endian()) << 44);
++    if (watchedClean && cached.contentHash != hash)
++    {
++        static std::atomic<int> logged{ 0 };
++        if (logged++ < 20)
++            Log("texture watch: %08X %ux%u (frame %llu) changed with no write seen", fetch.Address(), w, h, (unsigned long long)g_r.frame);
++        cached.watchArmed = false;
++    }
++    if (textureWatch && cached.resource && !watchedClean)
++    {
++        if (cached.contentHash != hash)
++        {
++            cached.watchArmed = false; // (changing: hashed for a while)
++            cached.watchQuietUntil = g_r.frame + 120;
++            cached.watchFalseWrites = 0;
++        }
++        else if (watchWritten && ++cached.watchFalseWrites >= 2)
++        {
++            cached.watchArmed = false; // (its pages are written, its contents not: a fault a frame for nothing)
++            cached.watchQuietUntil = g_r.frame + 1200;
++            cached.watchFalseWrites = 0;
++        }
++    }
+     if (cached.resource && cached.contentHash == hash && !forceDecode)
+     {
+         cached.unchanged++;
+diff --git a/src/precise_sleep.h b/src/precise_sleep.h
+index ae01ae2..cfbf7d3 100644
+--- a/src/precise_sleep.h
++++ b/src/precise_sleep.h
+@@ -5,6 +5,8 @@
+ // spun out (for the frame limiter and vblanks; guest sleeps don't spin).
+ #include <windows.h>
+ 
++#include <regpu/wine_wait.h>
++
+ #include <chrono>
+ #include <thread>
+ 
+@@ -20,7 +22,10 @@ inline void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline, in
+         std::this_thread::sleep_until(deadline);
+         return;
+     }
+-    if (left > spinUs)
++    // REGPU_WINE_WAITS (Wine): a nanosleep instead of a wineserver timer (regpu/wine_wait.h).
++    if (left > spinUs && regpu::winewait::On())
++        regpu::winewait::SleepUs(left - spinUs);
++    else if (left > spinUs)
+     {
+         LARGE_INTEGER due;
+         due.QuadPart = -int64_t(left - spinUs) * 10; // relative, 100 ns units
+diff --git a/src/render/presenter.cpp b/src/render/presenter.cpp
+index 29fa914..14707d3 100644
+--- a/src/render/presenter.cpp
++++ b/src/render/presenter.cpp
+@@ -875,6 +875,9 @@ bool PresenterRecordCopy(VkCommandBuffer cb, const vk::Image* src, const vk::Ima
+         black.float32[3] = 1.0f;
+         const VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+         vkCmdClearColorImage(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
++        // (The picture is written over the black next: ordered after the clear, as the overlays below.)
++        ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
++            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+     }
+     const bool canvasSize = !offsetX && !offsetY && sw == cw && sh == ch;
+     if (grade && canvasSize && bw == cw && bh == ch)
+@@ -915,15 +918,31 @@ bool PresenterRecordCopy(VkCommandBuffer cb, const vk::Image* src, const vk::Ima
+     }
+     else
+         Blit(cb, src->image, back, 0, 0, int32_t(shownW), int32_t(shownH), X(offsetX), Y(offsetY), X(offsetX + shownW), Y(offsetY + shownH));
++    // The overlays are written over the picture just written, and over one another (the compile overlay is wide and
++    // reaches the fps panel's rectangle): without a barrier between two writes the transfers may run at once on the GPU
++    // (synchronization validation on a Steam Deck: SYNC-HAZARD-WRITE-AFTER-WRITE in vkCmdBlitImage at the fps panel
++    // while shaders compile), and whichever lands last wins. A barrier before each overlay that follows another write.
++    // REGPU_NO_OVERLAY_BARRIER=1: as before (A/B).
++    static LiveSwitch noOverlayBarrier("REGPU_NO_OVERLAY_BARRIER");
++    const auto afterWrite = [&] {
++        if (!noOverlayBarrier)
++            ImageBarrier(cb, back, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
++                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++    };
+     if (overlay)
+     {
++        afterWrite();
+         const uint32_t x = offsetX + 24, y = offsetY + 24 + (timer ? timerH : 0);
+         Blit(cb, overlay->image, back, 0, 0, int32_t(overlayW), int32_t(overlayH), X(x), Y(y), X(x + overlayW), Y(y + overlayH));
+     }
+     if (timer && timerW <= cw && timerH <= ch)
++    {
++        afterWrite();
+         Blit(cb, timer->image, back, 0, 0, int32_t(timerW), int32_t(timerH), X(offsetX), Y(offsetY), X(offsetX + timerW), Y(offsetY + timerH));
++    }
+     if (fps && fpsW <= shownW && fpsH + 12 <= ch)
+     {
++        afterWrite();
+         // Top centre of the picture.
+         const uint32_t x = offsetX + (shownW - fpsW) / 2, y = offsetY + 12;
+         Blit(cb, fps->image, back, 0, 0, int32_t(fpsW), int32_t(fpsH), X(x), Y(y), X(x + fpsW), Y(y + fpsH));

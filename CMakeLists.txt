@@ -102,6 +102,35 @@ set(FM4_REGPU_DIR "${CMAKE_SOURCE_DIR}/thirdparty/ReGPU" CACHE PATH "ReGPU sourc
 add_subdirectory("${FM4_REGPU_DIR}" regpu)
 
 add_executable(fm4 ${FM4_SOURCES} "${CMAKE_SOURCE_DIR}/src/fm4.rc")
+
+# Profile-guided optimisation of ReGPU and FM4's own code (from the FM3 port, where ReGPU's gained ~6% on a Steam Deck):
+# FM4_PGO=gen instruments both (start with LLVM_PROFILE_FILE=<dir>/fm4-%p.profraw, play, then debug server
+# "env FM4_PGO_WRITE 1" writes the profile: src/pgo.cpp), then llvm-profdata merge -output=pgo/fm4.profdata <dir>/*.profraw;
+# FM4_PGO=use builds with FM4_PGO_PROFILE. The recompiled game code (fm4_ppc) is not changed, so switching rebuilds only
+# ReGPU and src/.
+set(FM4_PGO "off" CACHE STRING "ReGPU + FM4 profile-guided optimisation: off, gen or use")
+set_property(CACHE FM4_PGO PROPERTY STRINGS off gen use)
+set(FM4_PGO_PROFILE "${CMAKE_SOURCE_DIR}/pgo/fm4.profdata" CACHE FILEPATH "PGO profile (llvm-profdata merge output)")
+if(FM4_PGO STREQUAL "gen")
+    target_compile_options(regpu PRIVATE -fprofile-instr-generate)
+    target_compile_options(fm4 PRIVATE -fprofile-instr-generate)
+    get_filename_component(FM4_LLVM_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file(GLOB FM4_PROFILE_RT "${FM4_LLVM_BIN}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+    if(NOT FM4_PROFILE_RT)
+        message(FATAL_ERROR "FM4_PGO=gen: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}")
+    endif()
+    list(GET FM4_PROFILE_RT 0 FM4_PROFILE_RT)
+    target_link_libraries(fm4 PRIVATE "${FM4_PROFILE_RT}")
+    target_compile_definitions(fm4 PRIVATE FM4_PGO_GEN=1)
+elseif(FM4_PGO STREQUAL "use")
+    if(NOT EXISTS "${FM4_PGO_PROFILE}")
+        message(FATAL_ERROR "FM4_PGO=use: no profile at ${FM4_PGO_PROFILE}")
+    endif()
+    foreach(t regpu fm4)
+        target_compile_options(${t} PRIVATE "-fprofile-instr-use=${FM4_PGO_PROFILE}" -Wno-profile-instr-out-of-date
+            -Wno-profile-instr-unprofiled -Wno-backend-plugin)
+    endforeach()
+endif()
 target_include_directories(fm4 PRIVATE src "${FM4_GENERATED}"
     "${CMAKE_SOURCE_DIR}/${FM4_OUT_DIR}/ppc" thirdparty/XenonRecomp/thirdparty/simde)
 target_link_libraries(fm4 PRIVATE regpu)
