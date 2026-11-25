@@ -411,6 +411,9 @@ public sealed class Bridge
             },
             shaders = ShaderCache.Get(),
             dlc = Dlc.List(),
+            // The Deck optimizations tab: the Steam Deck found (its screen's Hz, 0 = not a Deck or not Linux), and whether
+            // the build without PGO is beside fm4.exe.
+            deck = new { screenHz = GameSettings.DeckScreenHz(), linux = Platform.Linux, noPgoExe = File.Exists(Path.Combine(Paths.Root, "fm4-nopgo.exe")) },
         };
     }
 }

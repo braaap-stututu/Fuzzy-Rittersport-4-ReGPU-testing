@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -44,6 +45,15 @@ void Log(const char* fmt, ...)
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     g_log(line);
+}
+
+// FM4_WHEEL_DI_ALL=1 (settings.ini deck_wheel_input=0, the launcher's Deck optimizations tab; src/deck.cpp): DirectInput
+// as before the Deck work: made with wheel_mode off too, and gamepads opened in auto mode. Read at each scan (the
+// Deck profile sets it from settings.ini once the runtime has started).
+bool DiAllDevices()
+{
+    const char* v = getenv("FM4_WHEEL_DI_ALL");
+    return v && *v && strcmp(v, "0") != 0;
 }
 
 double NowMs()
@@ -198,7 +208,7 @@ struct System::Impl
             bool off;
             {
                 std::lock_guard l(mutex);
-                off = cfg.mode == "off";
+                off = cfg.mode == "off" && !DiAllDevices();
             }
             if (off)
                 ReleaseAll();
@@ -278,7 +288,7 @@ struct System::Impl
                 // Gamepads (Steam's virtual pad, a Steam Deck's controller, PlayStation and Switch pads) play through
                 // XInput and are never wheels in auto mode (WheelLike): not opened, so DirectInput doesn't take their
                 // reports. wheel_mode = on still opens them (a wheel that says it is a gamepad).
-                if (GET_DIDEVICE_TYPE(f.type) == DI8DEVTYPE_GAMEPAD && cfg.mode != "on")
+                if (GET_DIDEVICE_TYPE(f.type) == DI8DEVTYPE_GAMEPAD && cfg.mode != "on" && !DiAllDevices())
                     continue;
                 auto d = std::make_unique<Dev>();
                 d->instance = f.instance;

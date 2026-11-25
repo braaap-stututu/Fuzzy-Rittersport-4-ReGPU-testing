@@ -284,6 +284,27 @@ note: Win64 frame pointers point into the frame, not at the saved rbp, so perf s
 llvm-symbolizer: dbghelp under Wine names few functions of the clang PDB; the unwind now stays inside fm4.exe and is
 guarded: it faulted in ntdll's Unix side and took the game down).
 
+## Deck optimizations tab and the portable build (25 Nov 2026)
+
+Every Deck / low-end optimisation can now be switched in the launcher's **Deck optimizations** tab. Each switch is a
+settings.ini key the game reads at start (src/deck.cpp, `ApplyDeckToggles`: a key at 0 sets the optimisation's own
+switch, unless that switch is already set in the environment), so `play.sh` follows them too; the log's `deck:` lines
+list what is off. Keys (1 = on, the default): `deck=auto|on|off`, `deck_presets`, `deck_texture_watch`,
+`deck_wine_waits`, `deck_xma_reuse`, `deck_msaa_layouts`, `deck_wheel_input` (new switch `FM4_WHEEL_DI_ALL=1`: DirectInput
+as before the Deck work), and two the launcher / play.sh apply: `deck_xalia` (`PROTON_USE_XALIA=0`) and `deck_pgo`
+(0 starts `fm4-nopgo.exe`, the same code without PGO, when it is beside fm4.exe). On a Steam Deck the launcher's first
+settings.ini gets the presets' 1280x800 and screen-Hz cap (it writes every key, so the game's own presets, which fill in
+only missing keys, would otherwise never apply from the launcher).
+
+**Windows build with the Deck profile:** clang-cl on Windows names anonymous-namespace functions with a hash of the
+source path (`?A0x...`), so the profile recorded with the Deck's build matched none of those (gpu.cpp: 77 of 159
+functions without data). `pgo/fm4-win.profdata` is `pgo/fm4.profdata` with those hashes renamed to the ones a build in
+`C:/claude code projects/fm4deck/src/fm4` gives (40 of 46 files; the rest are cold: crash, log, crypt, rtl,
+resources, pgo). Configure with `-DFM4_PGO=use -DFM4_PGO_PROFILE=pgo/fm4-win.profdata`; a checkout at another path needs
+the renaming again (`llvm-profdata merge --text`, replace each file's hash with the one in its .obj, merge back).
+The portable package (fm4.exe PGO + fm4-nopgo.exe, launcher for Windows and Linux, play.sh / play.cmd) was built that
+way and booted on Windows with every switch off and with the defaults; not yet measured on the Deck.
+
 ## Notes
 
 - A plain `./play.sh` (or `play-deck.sh`) started from a script here, with no window focus, sat at 1 fps after the

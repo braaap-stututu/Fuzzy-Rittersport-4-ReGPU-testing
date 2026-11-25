@@ -19,6 +19,7 @@
       <button data-tab="profiles">Profiles</button>
       <button data-tab="graphics">Graphics</button>
       <button data-tab="wheel">Wheel stuff</button>
+      <button data-tab="deck">Deck optimizations</button>
       <button data-tab="settings">Settings</button>
       <button data-tab="report">Report</button>
       <button data-tab="updates">Updates <span class="dot-badge" id="update-badge" hidden></span></button>
@@ -205,6 +206,66 @@
         <div><div class="toggle-title">Fast mode</div><div class="toggle-sub">The tested setup: leave it on</div></div>
         <button class="switch" id="fastMode" role="switch"></button>
       </div>
+    </section>
+    </div>
+  </main>
+
+  <!-- DECK OPTIMIZATIONS (settings.ini deck_*, read by src/deck.cpp; docs/DECK.md has the measurements) -->
+  <main class="page grid3" id="page-deck" hidden>
+    <section class="panel">
+      <div class="panel-head"><h2>Steam Deck profile</h2></div>
+      <p class="hint" id="deck-detected"></p>
+      <div class="field">
+        <span>Profile</span>
+        <div class="segmented seg3" id="deckMode">
+          <button data-mode="auto" data-tip="On when the game runs under Proton on a Steam Deck (LCD or OLED), off everywhere else.">Auto</button>
+          <button data-mode="on" data-tip="Always on, also on other PCs (the frame cap then follows the OLED's 90 Hz).">On</button>
+          <button data-mode="off" data-tip="Never on: the frame cap and resolution are exactly what the Graphics tab says.">Off</button>
+        </div>
+      </div>
+      <div class="toggle-row" data-tip="With the profile on: the frame cap goes down to the screen's refresh rate (60 on the LCD Deck, 90 on the OLED) when it's set higher, and a first start uses 1280x800 (the Deck's panel) instead of 1280x720. Frames the screen can't show only take power from the ones it can: the Deck's CPU and GPU share 15 W.">
+        <div><div class="toggle-title">Deck presets</div><div class="toggle-sub">Frame cap = screen Hz, 1280x800 on a first start</div></div>
+        <button class="switch" id="deckPresets" role="switch"></button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Low-end optimizations</h2></div>
+      <p class="hint">On everywhere they apply, not only on the Deck. Measured on a Steam Deck OLED: AI race 66–70 → 86–88 fps with all of them and the PGO build. Turn one off to compare, or if something looks or sounds wrong. Changes apply at the next start.</p>
+      <div class="toggle-row" data-tip="Textures are re-checked only when the game writes to their memory, instead of being hashed again every frame. Pixel-identical. REGPU_TEXTURE_NO_WATCH.">
+        <div><div class="toggle-title">Texture write watch</div><div class="toggle-sub">Skip re-hashing unchanged textures</div></div>
+        <button class="switch" id="deckTextureWatch" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="Short waits use a direct sleep instead of a timer that goes through Wine's wineserver. Only does anything under Proton or Wine. REGPU_WINE_WAITS.">
+        <div><div class="toggle-title">Proton waits</div><div class="toggle-sub">Short waits outside the wineserver</div></div>
+        <button class="switch" id="deckWineWaits" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="The audio decoder for each sound is reset and reused instead of being created again. Bit-exact: the sound is the same. FM2_XMA_REUSE.">
+        <div><div class="toggle-title">Audio decoder reuse</div><div class="toggle-sub">XMA codecs reused, same sound</div></div>
+        <button class="switch" id="deckXmaReuse" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="With MSAA on: the Deck's driver (Mesa RADV) keeps multisampled surfaces in their fast layouts, other drivers in the general one, each the faster for that driver. Off uses the general layout everywhere, as before. REGPU_VK_NO_MSAA_GENERAL.">
+        <div><div class="toggle-title">MSAA layouts by driver</div><div class="toggle-sub">Only matters with MSAA on</div></div>
+        <button class="switch" id="deckMsaaLayouts" role="switch"></button>
+      </div>
+      <div class="toggle-row" data-tip="DirectInput only runs while the Wheel stuff tab's wheel mode isn't off, and gamepads (the Deck's controls, Steam's virtual pad) aren't opened in auto mode: they play through XInput anyway. On the Deck this took the wineserver from ~23% of a core. FM4_WHEEL_DI_ALL.">
+        <div><div class="toggle-title">Wheel input only for wheels</div><div class="toggle-sub">Gamepads stay with XInput</div></div>
+        <button class="switch" id="deckWheelInput" role="switch"></button>
+      </div>
+    </section>
+
+    <div class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>Build &amp; Proton</h2></div>
+      <div class="toggle-row" id="deckPgoRow" data-tip="fm4.exe is built with profile-guided optimization from a Steam Deck recording (+5.5% in races there). Off starts fm4-nopgo.exe instead: the same code built without it.">
+        <div><div class="toggle-title">Profile-guided build (PGO)</div><div class="toggle-sub" id="deckPgoSub">fm4.exe, or fm4-nopgo.exe when off</div></div>
+        <button class="switch" id="deckPgo" role="switch"></button>
+      </div>
+      <div class="toggle-row" id="deckXaliaRow" data-tip="Proton's xalia, a helper for moving through windows with a controller, isn't needed by the game, which reads pads itself: 1.7% of the CPU in a Deck race. Only applies when the launcher starts the game through Proton (Linux). PROTON_USE_XALIA.">
+        <div><div class="toggle-title">Proton's xalia off</div><div class="toggle-sub">Linux / Steam Deck only</div></div>
+        <button class="switch" id="deckXalia" role="switch"></button>
+      </div>
+      <p class="hint">A switch set in the environment (for example <code>REGPU_WINE_WAITS=0 ./play.sh</code>) wins over this tab. The game's log lists what's turned off at each start ("deck:" lines). Details and every measurement: docs/DECK.md.</p>
     </section>
     </div>
   </main>

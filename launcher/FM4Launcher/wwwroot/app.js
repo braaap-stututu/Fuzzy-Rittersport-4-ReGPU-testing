@@ -133,20 +133,20 @@ $("tabs").onclick = (e) => {
   const b = e.target.closest("button")
   if (!b) return
   for (const t of $("tabs").children) t.classList.toggle("on", t === b)
-  for (const p of ["play", "profiles", "graphics", "wheel", "settings", "report", "updates", "about"]) $("page-" + p).hidden = p !== b.dataset.tab
+  for (const p of ["play", "profiles", "graphics", "wheel", "deck", "settings", "report", "updates", "about"]) $("page-" + p).hidden = p !== b.dataset.tab
   $("tabs").dataset.shown = b.dataset.tab
   // The Wheel stuff tab's live view runs only while it is open (wheel.js).
   if (b.dataset.tab === "wheel") wheelShow()
   else wheelHide()
   if (b.dataset.tab === "profiles") loadProfiles()
   else if (b.dataset.tab === "report") loadReport()
-  else if (b.dataset.tab !== "play" && b.dataset.tab !== "graphics" && b.dataset.tab !== "wheel") refresh()
+  else if (b.dataset.tab !== "play" && b.dataset.tab !== "graphics" && b.dataset.tab !== "wheel" && b.dataset.tab !== "deck") refresh()
 }
 
 // The title opens the About page (no tab of its own).
 $("brand").onclick = () => {
   for (const t of $("tabs").children) t.classList.remove("on")
-  for (const p of ["play", "profiles", "graphics", "wheel", "settings", "report", "updates"]) $("page-" + p).hidden = true
+  for (const p of ["play", "profiles", "graphics", "wheel", "deck", "settings", "report", "updates"]) $("page-" + p).hidden = true
   wheelHide()
   $("page-about").hidden = false
   $("tabs").dataset.shown = "about"
@@ -215,6 +215,18 @@ function render() {
     ? `Your disc also has ${o.missingLanguages.join(", ")} text. Those can't be picked yet.` : ""
   for (const b of $("display").children) b.classList.toggle("on", (b.dataset.full === "1") === set.fullscreen)
   for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay", "perfLog", "fpsPanel", "timer"]) $(k).classList.toggle("on", !!set[k])
+
+  // Deck optimizations page
+  for (const k of deckToggles) $(k).classList.toggle("on", !!set[k])
+  for (const b of $("deckMode").children) b.classList.toggle("on", b.dataset.mode === set.deck)
+  const d = s.deck
+  $("deck-detected").textContent = d.screenHz ? `Steam Deck found (${d.screenHz === 90 ? "OLED, 90 Hz" : "LCD, 60 Hz"}): Auto turns the profile on.`
+    : d.linux ? "No Steam Deck found: Auto leaves the profile off here." : "On Windows the launcher can't tell a Deck apart; under Proton the game checks the CPU itself (Auto)."
+  const noPgo = !d.noPgoExe
+  $("deckPgo").disabled = noPgo
+  $("deckPgoRow").classList.toggle("off", noPgo)
+  $("deckPgoSub").textContent = noPgo ? "fm4-nopgo.exe isn't in this install: always fm4.exe" : "fm4.exe, or fm4-nopgo.exe when off"
+  $("deckXaliaRow").classList.toggle("off", !d.linux)
 
   const lang = o.languages.find((l) => l.id === set.language)
   const aspect = o.aspects.find((a) => a.value === set.aspect)
@@ -357,6 +369,9 @@ $("sharpening").onchange = (e) => change({ sharpening: +e.target.value })
 $("language").onchange = (e) => change({ language: +e.target.value })
 $("display").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ fullscreen: b.dataset.full === "1" }) }
 for (const k of ["vsync", "enhance", "fastMode", "anisotropy", "hideShaderOverlay", "perfLog", "fpsPanel", "timer"]) $(k).onclick = () => change({ [k]: !state.settings[k] })
+const deckToggles = ["deckPresets", "deckTextureWatch", "deckWineWaits", "deckXmaReuse", "deckMsaaLayouts", "deckWheelInput", "deckXalia", "deckPgo"]
+for (const k of deckToggles) $(k).onclick = () => change({ [k]: !state.settings[k] })
+$("deckMode").onclick = (e) => { const b = e.target.closest("button"); if (b) change({ deck: b.dataset.mode }) }
 
 // ---- actions
 

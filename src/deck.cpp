@@ -14,6 +14,9 @@
 //                physics or more.)
 //   presets       for what settings.ini doesn't set (FM4_DECK_PRESETS=0: none): resolution 1280x800 (the panel), frame
 //                cap = the screen's refresh rate (90 on the OLED, where the built-in default is 60). See DeckProfileInit.
+//
+// Toggles (the launcher's "Deck optimizations" tab, ApplyDeckToggles): settings.ini deck_presets, deck_texture_watch,
+// deck_wine_waits, deck_xma_reuse, deck_msaa_layouts, deck_wheel_input = 0 turn each optimisation off.
 #include "deck.h"
 
 #include "log.h"
@@ -53,6 +56,42 @@ bool OnWine()
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     return ntdll && GetProcAddress(ntdll, "wine_get_version");
 }
+
+// The launcher's "Deck optimizations" tab: one settings.ini key per optimisation (1 = on, the default; 0 = off), each
+// turned into the switch the code already reads. A switch set in the environment (a test script, the player) wins.
+// deck_xalia (PROTON_USE_XALIA) and deck_pgo (which exe starts) are the launcher's and the play scripts'.
+struct DeckToggle
+{
+    const char* key;    // settings.ini
+    const char* env;    // the switch
+    const char* offVal; // its value with the key at 0
+    const char* what;
+};
+constexpr DeckToggle kToggles[] = {
+    {"deck_presets", "FM4_DECK_PRESETS", "0", "Deck presets (1280x800, frame cap = screen Hz)"},
+    {"deck_texture_watch", "REGPU_TEXTURE_NO_WATCH", "1", "texture write watch"},
+    {"deck_wine_waits", "REGPU_WINE_WAITS", "0", "Wine/Proton waits"},
+    {"deck_xma_reuse", "FM2_XMA_REUSE", "0", "XMA codec reuse"},
+    {"deck_msaa_layouts", "REGPU_VK_NO_MSAA_GENERAL", "0", "MSAA layouts by driver"},
+    {"deck_wheel_input", "FM4_WHEEL_DI_ALL", "1", "DirectInput only for wheels"},
+};
+
+void ApplyDeckToggles()
+{
+    const Settings& st = GetSettings();
+    for (const DeckToggle& t : kToggles)
+    {
+        if (st.Extra(t.key) != "0")
+            continue;
+        if (const char* v = getenv(t.env); v && *v)
+        {
+            Log("deck: %s off in settings.ini, but %s=%s is set: kept", t.what, t.env, v);
+            continue;
+        }
+        _putenv_s(t.env, t.offVal);
+        Log("deck: %s off (settings.ini %s=0: %s=%s)", t.what, t.key, t.env, t.offVal);
+    }
+}
 } // namespace
 
 bool DeckProfile()
@@ -62,6 +101,7 @@ bool DeckProfile()
 
 void DeckProfileInit()
 {
+    ApplyDeckToggles(); // (first: they apply with the profile on or off, and the presets below read FM4_DECK_PRESETS)
     const std::string cpu = CpuBrand();
     const bool wine = OnWine();
     const bool lcd = cpu.find("AMD Custom APU 0405") != std::string::npos;

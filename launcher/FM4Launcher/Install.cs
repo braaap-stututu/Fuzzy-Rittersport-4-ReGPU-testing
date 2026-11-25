@@ -10,7 +10,8 @@ public static class Paths
     /// <summary>The install folder: the first folder up from the launcher that holds build\fm4\fm4.exe (a source
     /// checkout) or fm4.exe itself (an install).</summary>
     public static readonly string Root = Env("FM4_ROOT") ?? FindRoot();
-    public static string Exe => Env("FM4_EXE") ?? (File.Exists(Path.Combine(Root, "fm4.exe")) ? Path.Combine(Root, "fm4.exe") : Path.Combine(Root, "build", "fm4", "fm4.exe"));
+    public static string Exe => Env("FM4_EXE") ?? (!GameSettings.Load().DeckPgo && File.Exists(Path.Combine(Root, "fm4-nopgo.exe")) ? Path.Combine(Root, "fm4-nopgo.exe")
+        : File.Exists(Path.Combine(Root, "fm4.exe")) ? Path.Combine(Root, "fm4.exe") : Path.Combine(Root, "build", "fm4", "fm4.exe"));
     /// <summary>Linux: the Proton prefix the game runs in (as linux/release/play.sh picks it).</summary>
     public static readonly string CompatData = Environment.GetEnvironmentVariable("FM4_COMPATDATA") is { Length: > 0 } c ? c
         : Path.Combine(Environment.GetEnvironmentVariable("FM4_LINUX_HOME") is { Length: > 0 } h ? h
@@ -87,14 +88,47 @@ public sealed class GameSettings
     public bool FastMode { get; set; } = true; // launcher only: set on the game's environment at launch
     public int Language { get; set; } = 1;
 
+    // The Deck optimizations tab (docs/DECK.md). Read by the game (src/deck.cpp: deck=auto|on|off, the rest 1 on / 0
+    // off, each turned into its REGPU_* / FM2_* / FM4_* switch), except DeckXalia (PROTON_USE_XALIA at launch, Linux)
+    // and DeckPgo (which exe starts: fm4.exe, the PGO build, or fm4-nopgo.exe beside it).
+    public string Deck { get; set; } = "auto";
+    public bool DeckPresets { get; set; } = true;
+    public bool DeckTextureWatch { get; set; } = true;
+    public bool DeckWineWaits { get; set; } = true;
+    public bool DeckXmaReuse { get; set; } = true;
+    public bool DeckMsaaLayouts { get; set; } = true;
+    public bool DeckWheelInput { get; set; } = true;
+    public bool DeckXalia { get; set; } = true;
+    public bool DeckPgo { get; set; } = true;
+
     // What fm4.exe reads (src/settings.cpp). FM2's later options (SMAA, anisotropy, render scale, vertex arena, the
     // shader pop-up, music) have no counterpart in FM4's runtime yet, so they aren't offered. The racing wheel's
     // wheel_* keys are the Wheel stuff tab's (Wheel.cs); Save keeps them like any other key it doesn't know.
-    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "game_folder", "title_update_folder", "enhance", "hide_shader_overlay", "language", "timer", "fps_panel"];
+    static readonly string[] Known = ["profile", "resolution", "aspect", "fullscreen", "vsync", "max_fps", "msaa", "smaa", "anisotropy", "fast_mode", "upscaler", "upscale_quality", "sharpness", "optimize_level", "debug_view", "perf_log", "game_folder", "title_update_folder", "enhance", "hide_shader_overlay", "language", "timer", "fps_panel",
+        "deck", "deck_presets", "deck_texture_watch", "deck_wine_waits", "deck_xma_reuse", "deck_msaa_layouts", "deck_wheel_input", "deck_xalia", "deck_pgo"];
+
+    /// <summary>Linux on a Steam Deck: its screen's refresh rate (60 the LCD "Jupiter", 90 the OLED "Galileo"), else 0.</summary>
+    public static int DeckScreenHz()
+    {
+        if (!Platform.Linux) return 0;
+        try
+        {
+            var product = File.ReadAllText("/sys/devices/virtual/dmi/id/product_name").Trim();
+            return product == "Jupiter" ? 60 : product == "Galileo" ? 90 : 0;
+        }
+        catch (Exception) { return 0; }
+    }
 
     public static GameSettings Load()
     {
         var s = new GameSettings();
+        // The Deck presets (src/deck.cpp) for a first start from here: the launcher writes every key, so the game's own
+        // presets (which fill in only keys settings.ini doesn't set) would never apply. Gated by the tab's switch once saved.
+        if (!File.Exists(Paths.SettingsFile) && DeckScreenHz() is > 0 and var hz)
+        {
+            s.Resolution = "1280x800";
+            s.MaxFps = hz;
+        }
         foreach (var (k, v) in Read())
             switch (k)
             {
@@ -124,6 +158,15 @@ public sealed class GameSettings
                 case "fps_panel": s.FpsPanel = v != "0"; break;
                 case "fast_mode": s.FastMode = v != "0"; break;
                 case "language": s.Language = int.TryParse(v, out var l) && l > 0 ? l : 1; break;
+                case "deck": s.Deck = v is "on" or "off" ? v : "auto"; break;
+                case "deck_presets": s.DeckPresets = v != "0"; break;
+                case "deck_texture_watch": s.DeckTextureWatch = v != "0"; break;
+                case "deck_wine_waits": s.DeckWineWaits = v != "0"; break;
+                case "deck_xma_reuse": s.DeckXmaReuse = v != "0"; break;
+                case "deck_msaa_layouts": s.DeckMsaaLayouts = v != "0"; break;
+                case "deck_wheel_input": s.DeckWheelInput = v != "0"; break;
+                case "deck_xalia": s.DeckXalia = v != "0"; break;
+                case "deck_pgo": s.DeckPgo = v != "0"; break;
             }
         return s;
     }
@@ -140,6 +183,8 @@ public sealed class GameSettings
         var sharp = (Math.Clamp(Sharpening, 0, 100) / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture);
         sb.Append($"upscaler={(Options.Upscalers.Any(u => u.Value == Upscaler) ? Upscaler : "off")}\nupscale_quality={Math.Clamp(Upscale, 1, 4)}\nsharpness={sharp}\n");
         sb.Append($"optimize_level={Math.Clamp(OptimizeLevel, 0, 3)}\ndebug_view={(DebugView is "motion" or "depth" ? DebugView : "off")}\nperf_log={B(PerfLog)}\ngame_folder={Clean(GameFolder)}\ntitle_update_folder={Clean(TitleUpdateFolder)}\n");
+        sb.Append($"deck={(Deck is "on" or "off" ? Deck : "auto")}\ndeck_presets={B(DeckPresets)}\ndeck_texture_watch={B(DeckTextureWatch)}\ndeck_wine_waits={B(DeckWineWaits)}\n");
+        sb.Append($"deck_xma_reuse={B(DeckXmaReuse)}\ndeck_msaa_layouts={B(DeckMsaaLayouts)}\ndeck_wheel_input={B(DeckWheelInput)}\ndeck_xalia={B(DeckXalia)}\ndeck_pgo={B(DeckPgo)}\n");
 
         foreach (var (k, v) in keep) sb.Append($"{k}={v}\n");
         Directory.CreateDirectory(Paths.User);
@@ -256,9 +301,10 @@ public static class Options
 /// <summary>Starting the game, as play-fm4.cmd does: the DLC next to the install copied in first.</summary>
 public static class Game
 {
-    public static bool Running => Platform.Linux ? RunningUnderWine() : Process.GetProcessesByName("fm4").Any(p =>
+    // (fm4-nopgo.exe: the Deck optimizations tab's build without PGO, beside fm4.exe)
+    public static bool Running => Platform.Linux ? RunningUnderWine() : Process.GetProcessesByName("fm4").Concat(Process.GetProcessesByName("fm4-nopgo")).Any(p =>
     {
-        try { return string.Equals(p.MainModule?.FileName, Paths.Exe, StringComparison.OrdinalIgnoreCase); }
+        try { return Path.GetDirectoryName(p.MainModule?.FileName) is { } d && string.Equals(d, Path.GetDirectoryName(Paths.Exe), StringComparison.OrdinalIgnoreCase); }
         catch { return true; } // can't look inside: assume it is ours
     });
 
@@ -273,7 +319,7 @@ public static class Game
                 string cmdline;
                 try { cmdline = File.ReadAllText(Path.Combine(dir, "cmdline")); } catch { continue; }
                 var first = cmdline.Split('\0')[0];
-                if (first.EndsWith("fm4.exe", StringComparison.OrdinalIgnoreCase)) return true;
+                if (first.EndsWith("fm4.exe", StringComparison.OrdinalIgnoreCase) || first.EndsWith("fm4-nopgo.exe", StringComparison.OrdinalIgnoreCase)) return true;
             }
         }
         catch { }
@@ -307,6 +353,10 @@ public static class Game
         // Wine's own d3dcompiler_47 can't compile the renderer's shaders: the Microsoft DLL beside fm4.exe instead.
         var overrides = Environment.GetEnvironmentVariable("WINEDLLOVERRIDES");
         psi.Environment["WINEDLLOVERRIDES"] = "d3dcompiler_47=n" + (string.IsNullOrEmpty(overrides) ? "" : ";" + overrides);
+        // Proton's xalia (a UI helper for controller navigation of windows; the game reads pads itself): 1.7% of a
+        // Steam Deck race's CPU samples. Off unless the Deck optimizations tab turns this off or PROTON_USE_XALIA is set.
+        if (GameSettings.Load().DeckXalia && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("PROTON_USE_XALIA")))
+            psi.Environment["PROTON_USE_XALIA"] = "0";
         return psi;
     }
 
