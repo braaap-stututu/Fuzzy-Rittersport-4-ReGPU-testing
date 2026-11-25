@@ -21,6 +21,8 @@ int main(int argc, char** argv)
     // them (src/input/wheel/wheel_probe.cpp). Nothing of the game is loaded.
     if (argc > 1 && strcmp(argv[1], "--wheel-probe") == 0)
         return wheel::ProbeMain();
+    void LockStatsInit();
+    LockStatsInit(); // (FM4_LOCK_STATS=1 only: src/lock_stats.cpp)
     CrashHandlerInit();
     std::filesystem::path gameDir = argc > 1 ? argv[1] : "game";
     Log("fm2: game folder %s", std::filesystem::absolute(gameDir).string().c_str());

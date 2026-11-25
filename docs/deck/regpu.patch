@@ -129,7 +129,7 @@ index e6ded1d..6d7e9bc 100644
                  LARGE_INTEGER due;
                  due.QuadPart = -int64_t(left) * 10;
 diff --git a/src/gpu/renderer.cpp b/src/gpu/renderer.cpp
-index 8372163..71cb0d8 100644
+index 8372163..f19fc25 100644
 --- a/src/gpu/renderer.cpp
 +++ b/src/gpu/renderer.cpp
 @@ -896,6 +896,10 @@ struct CachedTexture
@@ -162,7 +162,19 @@ index 8372163..71cb0d8 100644
      s.vk.general = !depth && desc.samples > VK_SAMPLE_COUNT_1_BIT && !noGeneral;
      CountCreate(depth ? "depth surface" : "colour surface");
      // Starts as a target, as D3D12's did (created in RENDER_TARGET / DEPTH_WRITE), in order with the recorded commands.
-@@ -8583,6 +8595,38 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+@@ -5884,9 +5896,10 @@ std::atomic<bool> g_psEdits{ false };
+ std::unordered_set<uint64_t> g_psEditEver; // every alias made (kept out of the pipeline manifest)
+ std::atomic<bool> g_psEditAny{ false };    // g_psEditEver has one (IsPsEditAlias's fast path)
+ // The debug server's drawstats: draws per (vs, ps) over one frame.
++std::atomic<uint32_t> g_drawStatsSeq[4]; // drawstats: draws issued, after a pipeline bind, of those with the vertex shader changed, with only the pixel shader changed
+ std::atomic<int> g_drawStats{ 0 }; // 1 armed for the next frame, 2 counting, 0 off
+ std::mutex g_drawStatsMutex;
+-std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_drawStatsCounts;
++std::map<std::pair<uint64_t, uint64_t>, std::pair<uint32_t, uint64_t>> g_drawStatsCounts; // draws, indices (NUM_INDICES)
+ bool IsPsEditAlias(uint64_t hash)
+ {
+     if (!g_psEditAny.load(std::memory_order_acquire))
+@@ -8583,6 +8596,38 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
      LiveSwitch &stagger = g_sw_REGPU_TEXTURE_CHECK_STAGGER;
      const bool checkAlways = !stagger;
      const uint64_t textureKey = TextureKey(fetch.Address(), fetch.Format(), w, h);
@@ -201,7 +213,7 @@ index 8372163..71cb0d8 100644
      // Unchanged for 300 checks (a few seconds): every 16th frame (a CPU-side update shows up at most
      // ~0.1 s late). REGPU_TEXTURE_CHECK_EVERY4=1 keeps every 4th (A/B).
      LiveSwitch &every4 = g_sw_REGPU_TEXTURE_CHECK_EVERY4;
-@@ -8591,7 +8635,7 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+@@ -8591,7 +8636,7 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
      // long enough to be, each on its own frames, and when it played again its brightness and colour came
      // from different frames for a frame or two (FM2 port, report #15). REGPU_STAGGER_CHANGING=1: as before.
      static LiveSwitch noChangingCheck("REGPU_STAGGER_CHANGING");
@@ -210,7 +222,7 @@ index 8372163..71cb0d8 100644
          (cached.changes < 8 || noChangingCheck) && ((g_r.frame + (textureKey >> 32)) & checkMask) != 0)
      {
          if (((g_r.frame + 1 + (textureKey >> 32)) & checkMask) == 0) // due next frame: hashed ahead
-@@ -8617,8 +8661,42 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
+@@ -8617,8 +8662,42 @@ GpuImage* GetTextureLocked(const TextureFetch& fetch, VkFormat& format, bool& na
      const uint8_t* source;
      size_t sourceBytes, hashStride;
      TextureHashSpan(fetch, w, h, source, sourceBytes, hashStride);
@@ -253,6 +265,305 @@ index 8372163..71cb0d8 100644
      if (cached.resource && cached.contentHash == hash && !forceDecode)
      {
          cached.unchanged++;
+@@ -15166,7 +15245,9 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
+     {
+         std::lock_guard lock(g_drawStatsMutex);
+-        g_drawStatsCounts[{ psAlias.realVs, psAlias.real }]++;
++        auto& n = g_drawStatsCounts[{ psAlias.realVs, psAlias.real }];
++        n.first++;
++        n.second += initiator >> 16;
+     }
+     const CompiledShader& ps = GetShader(C().psHash, C().psCode, true);
+     Section(1);
+@@ -17336,6 +17417,12 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
+             const bool oneTriangle = exp == 2 || exp >= 4;
+             const bool skip = (exp == 5 && g_pipelineBoundSinceDraw) || (exp >= 6 && !g_pipelineBoundSinceDraw) || (exp == 7 && !vsChanged) ||
+                 (exp == 8 && (vsChanged || !psChanged));
++            if (g_drawStats.load(std::memory_order_relaxed) == 2)
++            {
++                g_drawStatsSeq[0]++;
++                if (g_pipelineBoundSinceDraw)
++                    g_drawStatsSeq[1]++, g_drawStatsSeq[vsChanged ? 2 : 3] += vsChanged || psChanged;
++            }
+             g_pipelineBoundSinceDraw = false;
+             for (int call = 0; call < (exp == 4 ? 2 : 1); call++)
+                 if (exp == 1 || skip)
+@@ -19229,20 +19316,24 @@ std::string RendererDrawStats()
+     {
+         std::lock_guard lock(g_drawStatsMutex);
+         g_drawStatsCounts.clear();
++        for (auto& n : g_drawStatsSeq)
++            n = 0;
+     }
+     g_drawStats = 1;
+     for (int i = 0; i < 400 && g_drawStats.load() != 0; i++)
+         Sleep(5);
+     std::lock_guard lock(g_drawStatsMutex);
+     std::string out;
+-    char buf[96];
++    char buf[128];
+     for (const auto& [k, n] : g_drawStatsCounts)
+     {
+-        snprintf(buf, sizeof(buf), "%s{\"vs\":\"%016llx\",\"ps\":\"%016llx\",\"draws\":%u}", out.empty() ? "" : ",", (unsigned long long)k.first,
+-            (unsigned long long)k.second, n);
++        snprintf(buf, sizeof(buf), "%s{\"vs\":\"%016llx\",\"ps\":\"%016llx\",\"draws\":%u,\"indices\":%llu}", out.empty() ? "" : ",",
++            (unsigned long long)k.first, (unsigned long long)k.second, n.first, (unsigned long long)n.second);
+         out += buf;
+     }
+-    return out;
++    // (After the pairs: "seq":[draws issued, after a pipeline bind, of those vs changed, ps changed only].)
++    snprintf(buf, sizeof(buf), "],\"seq\":[%u,%u,%u,%u", g_drawStatsSeq[0].load(), g_drawStatsSeq[1].load(), g_drawStatsSeq[2].load(), g_drawStatsSeq[3].load());
++    return out + buf;
+ }
+ 
+ void regpu::SetGameWidescreen(bool on) { g_gameWidescreen.store(on, std::memory_order_relaxed); }
+diff --git a/src/gpu/spirv/translate.cpp b/src/gpu/spirv/translate.cpp
+index 51a32a5..e341e0d 100644
+--- a/src/gpu/spirv/translate.cpp
++++ b/src/gpu/spirv/translate.cpp
+@@ -1482,6 +1482,78 @@ struct Translator
+         });
+         return Load(tU, out);
+     }
++    // REGPU_VFETCH_BATCH=1 (start-time, opt-in; unset or 0: LoadGuest per word): a vertex fetch's words loaded
++    // together, so the driver can issue them back to back and wait once. LoadGuest put each word in its own branch (the
++    // bounds check, divergent) and its own gmem/gphys branch, and swapped it at once: RADV waited for every load before
++    // the next (Steam Deck, FM4's grid: 18 full waits in a 24-load vertex shader, latency 18,000 cycles a wave). Here
++    // one uniform branch picks the buffer for all words, each address is clamped into the buffer and the word past its
++    // end (dword >= vf.w) is replaced by 0 after the load (the Xenos fetches 0 there, as LoadGuest), and the swap is two
++    // steps (bytes in halves for endian 1 and 2, halves for 2 and 3) instead of all three forms and three selects.
++    // Measured (Deck, 24 Nov 2026): RADV's estimate fell (instructions -12%, latency -22%, index-weighted), the frame
++    // didn't (grid GPU 12.27 against 12.52 ms, vertex work alone 11.21 against 11.34 ms: noise). Kept as an option for
++    // GPUs where vertex fetch latency shows.
++    static bool BatchVertexFetch()
++    {
++        static const bool on = [] {
++            const char* v = getenv("REGPU_VFETCH_BATCH");
++            return v && *v && strcmp(v, "0") != 0;
++        }();
++        return on;
++    }
++    static uint32_t FetchWords(uint32_t format)
++    {
++        switch (format)
++        {
++        case 26: case 32: case 34: case 37: return 2;
++        case 57: return 3;
++        case 35: case 38: return 4;
++        default: return 1; // (6, 7, 16, 17, 25, 31, 33, 36; unknown formats read no word)
++        }
++    }
++    void LoadGuestWords(uint32_t fetch, uint32_t dword, uint32_t count, uint32_t* words)
++    {
++        const SpirvOptions::VertexSpec* vspec = nullptr;
++        if (options.vsSpec)
++            for (const SpirvOptions::VertexSpec& v : options.vertexSpecs)
++                if (v.fetch == fetch)
++                    vspec = &v;
++        const uint32_t size = Vf(fetch, 3);
++        // (An empty buffer: every word 0, and the address is the buffer's first dword, never vf.x's.)
++        const uint32_t last = UOp(spv::OpISub, b.Ext(tU, GLSLstd450UMax, { size, U(1) }), U(1));
++        const uint32_t base = SelU(UEq(size, 0), U(0), Vf(fetch, 0));
++        uint32_t addr[4], raw[4];
++        for (uint32_t i = 0; i < count; i++)
++        {
++            const uint32_t di = i ? UOp(spv::OpIAdd, dword, U(i)) : dword;
++            const uint32_t clamped = b.Ext(tU, GLSLstd450UMin, { di, last });
++            addr[i] = UOp(spv::OpIAdd, base, UOp(spv::OpIMul, clamped, U(4)));
++        }
++        if (vspec)
++            for (uint32_t i = 0; i < count; i++)
++                raw[i] = GuestWord(vspec->phys ? gphysV : gmemV, addr[i]);
++        else
++        {
++            uint32_t vars[4];
++            for (uint32_t i = 0; i < count; i++)
++                vars[i] = b.Variable(pFnU);
++            b.If(Bin(spv::OpINotEqual, tB, Vf(fetch, 2), U(0)),
++                [&] { for (uint32_t i = 0; i < count; i++) Store(vars[i], GuestWord(gphysV, addr[i])); },
++                [&] { for (uint32_t i = 0; i < count; i++) Store(vars[i], GuestWord(gmemV, addr[i])); });
++            for (uint32_t i = 0; i < count; i++)
++                raw[i] = Load(tU, vars[i]);
++        }
++        const uint32_t e = vspec ? U(vspec->endian) : Vf(fetch, 1);
++        const uint32_t bytes = Bin(spv::OpLogicalOr, tB, UEq(e, 1), UEq(e, 2));
++        const uint32_t halves = Bin(spv::OpUGreaterThanEqual, tB, e, U(2));
++        for (uint32_t i = 0; i < count; i++)
++        {
++            uint32_t v = raw[i];
++            v = SelU(bytes, UOr(UShl(UAnd(v, 0x00FF00FFu), 8), UAnd(UShr(v, 8), 0x00FF00FFu)), v);
++            v = SelU(halves, UOr(UShl(v, 16), UShr(v, 16)), v);
++            const uint32_t di = i ? UOp(spv::OpIAdd, dword, U(i)) : dword;
++            words[i] = SelU(Bin(spv::OpULessThan, tB, di, size), v, U(0));
++        }
++    }
+     uint32_t SignExtend(uint32_t v, uint32_t bits)
+     {
+         const uint32_t i = b.Op(spv::OpBitcast, tI, { UShl(v, 32 - bits) });
+@@ -1587,6 +1659,8 @@ struct Translator
+         const uint32_t idx = b.Ext(tF, lastRound ? GLSLstd450RoundEven : GLSLstd450Floor, { Load(tF, vfi) });
+         const uint32_t d = UOp(spv::OpIAdd, UOp(spv::OpIMul, b.Op(spv::OpConvertFToU, tU, { FMax(idx, F(0)) }), U(lastStride)), U(f.offset));
+         uint32_t words[4] = {};
++        if (BatchVertexFetch())
++            LoadGuestWords(constIndex, d, FetchWords(f.format), words);
+         auto w = [&](uint32_t i) {
+             if (!words[i])
+                 words[i] = LoadGuest(constIndex, i ? UOp(spv::OpIAdd, d, U(i)) : d);
+diff --git a/src/gpu/vk/device.cpp b/src/gpu/vk/device.cpp
+index 47b9766..c865e7f 100644
+--- a/src/gpu/vk/device.cpp
++++ b/src/gpu/vk/device.cpp
+@@ -427,6 +427,7 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
+             optional(name);
+     // (A debugging aid: drivers may keep more about each pipeline with it.)
+     d.shaderInfo = getenv("REGPU_SHADER_STATS") && optional(VK_AMD_SHADER_INFO_EXTENSION_NAME);
++    const bool execStats = getenv("REGPU_SHADER_STATS") && optional(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+     // NVIDIA's NGX (DLSS on Vulkan, dlss.cpp) needs these two where the driver has them.
+     d.ngx = optional("VK_NVX_binary_import") && optional("VK_NVX_image_view_handle");
+ 
+@@ -593,6 +594,15 @@ void CreateDevice(Device& d, const std::filesystem::path& cacheDir, const HostDe
+         *tail = &dyn3;
+         tail = &dyn3.pNext;
+     }
++    // REGPU_SHADER_STATS: the driver's statistics of each pipeline (pipelines.cpp LogShaderStats).
++    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR execOn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
++    execOn.pipelineExecutableInfo = VK_TRUE;
++    if (execStats)
++    {
++        *tail = &execOn;
++        tail = &execOn.pNext;
++        d.execStats = true;
++    }
+     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gplOn{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+     gplOn.graphicsPipelineLibrary = haveGpl.graphicsPipelineLibrary;
+     if (gpl && haveGpl.graphicsPipelineLibrary)
+diff --git a/src/gpu/vk/device.h b/src/gpu/vk/device.h
+index d47e83d..8963fb9 100644
+--- a/src/gpu/vk/device.h
++++ b/src/gpu/vk/device.h
+@@ -66,6 +66,7 @@ struct Device
+     bool dynamicBlend = false;
+     // VK_EXT_graphics_pipeline_library with fast linking: the renderer builds its draws' pipelines from cached parts.
+     bool pipelineLibrary = false;
++    bool execStats = false; // VK_KHR_pipeline_executable_properties, with REGPU_SHADER_STATS only (registers, spills, waves per pipeline)
+     bool shaderInfo = false; // VK_AMD_shader_info, with REGPU_SHADER_STATS only (vk::CreateGraphicsPipeline logs each pipeline's) // VK_EXT_mutable_descriptor_type: XeSS's descriptor sets use it
+     bool ngx = false;                  // VK_NVX_binary_import and VK_NVX_image_view_handle (DLSS through NGX)
+     bool storageReadWithoutFormat = false; // shaderStorageImageReadWithoutFormat (the post filters read storage images)
+diff --git a/src/gpu/vk/pipelines.cpp b/src/gpu/vk/pipelines.cpp
+index c6d64f1..2d3a5df 100644
+--- a/src/gpu/vk/pipelines.cpp
++++ b/src/gpu/vk/pipelines.cpp
+@@ -4,6 +4,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <vector>
+ 
+ #include "log.h"
+ 
+@@ -33,6 +34,83 @@ void Destroy(Device& d, ShaderModule& m)
+ // REGPU_SHADER_STATS (see below), for a complete or linked pipeline.
+ static void LogShaderStats(Device& d, VkPipeline pipeline, const char* name)
+ {
++    // REGPU_SHADER_STATS=1 with VK_KHR_pipeline_executable_properties (RADV and others): every statistic the driver
++    // gives for each executable, "shader stats: <name> [<executable>] <stat> <value>, ...".
++    if (d.execStats && vkGetPipelineExecutablePropertiesKHR && vkGetPipelineExecutableStatisticsKHR)
++    {
++        VkPipelineInfoKHR pi{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
++        pi.pipeline = pipeline;
++        uint32_t count = 0;
++        vkGetPipelineExecutablePropertiesKHR(d.device, &pi, &count, nullptr);
++        std::vector<VkPipelineExecutablePropertiesKHR> props(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
++        if (count)
++            vkGetPipelineExecutablePropertiesKHR(d.device, &pi, &count, props.data());
++        for (uint32_t i = 0; i < count; i++)
++        {
++            VkPipelineExecutableInfoKHR ei{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
++            ei.pipeline = pipeline;
++            ei.executableIndex = i;
++            uint32_t n = 0;
++            vkGetPipelineExecutableStatisticsKHR(d.device, &ei, &n, nullptr);
++            std::vector<VkPipelineExecutableStatisticKHR> stats(n, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
++            if (n)
++                vkGetPipelineExecutableStatisticsKHR(d.device, &ei, &n, stats.data());
++            std::string line;
++            for (const auto& st : stats)
++            {
++                char part[128];
++                switch (st.format)
++                {
++                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf(part, sizeof(part), "%s=%u", st.name, st.value.b32); break;
++                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf(part, sizeof(part), "%s=%lld", st.name, (long long)st.value.i64); break;
++                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf(part, sizeof(part), "%s=%llu", st.name, (unsigned long long)st.value.u64); break;
++                default: snprintf(part, sizeof(part), "%s=%g", st.name, st.value.f64); break;
++                }
++                line += (line.empty() ? "" : ", ") + std::string(part);
++            }
++            Log("shader stats: %s [%s] %s", name ? name : "?", props[i].name, line.c_str());
++            // REGPU_SHADER_ISA=<part of a pipeline name>[,<part>...]: the driver's internal representations (RADV: NIR,
++            // ACO IR, disassembly) to out/isa_<name>_<executable>.txt.
++            static const char* isaWant = getenv("REGPU_SHADER_ISA");
++            bool want = false;
++            if (isaWant && name)
++                for (const char* s = isaWant; *s;)
++                {
++                    const char* e = strchr(s, ',');
++                    const std::string part(s, e ? size_t(e - s) : strlen(s));
++                    if (!part.empty() && strstr(name, part.c_str()))
++                        want = true;
++                    s = e ? e + 1 : s + strlen(s);
++                }
++            if (want && vkGetPipelineExecutableInternalRepresentationsKHR)
++            {
++                uint32_t nr = 0;
++                vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, nullptr);
++                std::vector<VkPipelineExecutableInternalRepresentationKHR> reps(nr, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR });
++                if (nr)
++                    vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, reps.data());
++                std::vector<std::string> texts(nr);
++                for (uint32_t r = 0; r < nr; r++)
++                {
++                    texts[r].resize(reps[r].dataSize);
++                    reps[r].pData = texts[r].data();
++                }
++                if (nr)
++                    vkGetPipelineExecutableInternalRepresentationsKHR(d.device, &ei, &nr, reps.data());
++                std::string base = name;
++                for (char& ch : base)
++                    if (ch == '/')
++                        ch = '_';
++                const std::string file = "out/isa_" + base + "_" + props[i].name + ".txt";
++                if (FILE* f = fopen(file.c_str(), "wb"))
++                {
++                    for (uint32_t r = 0; r < nr; r++)
++                        fprintf(f, "==== %s: %s\n%s\n", reps[r].name, reps[r].description, texts[r].c_str());
++                    fclose(f);
++                }
++            }
++        }
++    }
+     // REGPU_SHADER_STATS=1 (AMD, VK_AMD_shader_info): each stage's registers, scratch and code size, to compare shader
+     // translations (gpu/spirv against HLSL): "shader stats: <name> vs vgpr V sgpr S scratch B isa N | ps ...".
+     if (d.shaderInfo && vkGetShaderInfoAMD)
+@@ -228,6 +306,8 @@ static VkPipeline BuildGraphics(Device& d, const PipelineDesc& p, const char* na
+     gi.pDynamicState = dynamic.empty() ? nullptr : &dyn;
+     gi.layout = pre || frag ? p.layout : VK_NULL_HANDLE;
+     VkPipeline pipeline = VK_NULL_HANDLE;
++    if (d.execStats)
++        gi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (getenv("REGPU_SHADER_ISA") ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
+     const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
+     if (result != VK_SUCCESS)
+     {
+@@ -262,6 +342,8 @@ VkPipeline LinkGraphicsPipeline(Device& d, const VkPipeline* libraries, uint32_t
+     gi.flags = optimize ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0;
+     gi.layout = layout;
+     VkPipeline pipeline = VK_NULL_HANDLE;
++    if (d.execStats)
++        gi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (getenv("REGPU_SHADER_ISA") ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
+     const VkResult result = vkCreateGraphicsPipelines(d.device, d.pipelineCache, 1, &gi, nullptr, &pipeline);
+     if (result != VK_SUCCESS)
+     {
 diff --git a/src/precise_sleep.h b/src/precise_sleep.h
 index ae01ae2..cfbf7d3 100644
 --- a/src/precise_sleep.h

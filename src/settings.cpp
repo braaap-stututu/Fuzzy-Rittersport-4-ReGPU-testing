@@ -52,6 +52,7 @@ void Load()
         if (eq == std::string::npos || line[0] == '#' || line[0] == ';')
             continue;
         const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        g_settings.fromFile.insert(key);
         if (key == "profile" && !value.empty())
             g_settings.profile = value.substr(0, 15);
         else if (key == "resolution")

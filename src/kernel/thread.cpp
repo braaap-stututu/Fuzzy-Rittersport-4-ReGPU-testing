@@ -572,6 +572,46 @@ void SpikeDump(double ms)
     }
 }
 
+// FM2_SAMPLE_CALLERS: the two callers of a stopped thread, only from inside fm4.exe (under Wine a thread stopped in
+// ntdll's Unix side has a context RtlVirtualUnwind can't follow: it faulted there, Steam Deck 25 Nov 2026), and
+// guarded: a wrong frame ends the walk instead of the process. (Plain C: __try can't unwind C++ objects.)
+void UnwindCallers(const CONTEXT& c, DWORD64 (&up)[2])
+{
+    static const auto image = [] {
+        const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        return std::pair<uintptr_t, uintptr_t>(base, base + nt->OptionalHeader.SizeOfImage);
+    }();
+    CONTEXT u = c;
+    __try
+    {
+        for (int k = 0; k < 2; k++)
+        {
+            if (u.Rip < image.first || u.Rip >= image.second)
+                break;
+            DWORD64 imageBase = 0;
+            auto* fn = RtlLookupFunctionEntry(u.Rip, &imageBase, nullptr);
+            if (!fn)
+            {
+                u.Rip = *reinterpret_cast<DWORD64*>(u.Rsp); // leaf
+                u.Rsp += 8;
+            }
+            else
+            {
+                void* handlerData = nullptr;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, u.Rip, fn, &u, &handlerData, &establisher, nullptr);
+            }
+            up[k] = u.Rip;
+            if (!u.Rip)
+                break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
 extern HANDLE g_profiledWorker; // ReGPU's first draw piece worker (src/gpu/renderer.cpp; global in the Vulkan ReGPU)
 
 // Sampling profiler (FM2_SAMPLE_THREAD=<guest thread id>; FM2_PROFILE is the profile name): every millisecond, read the
@@ -611,33 +651,21 @@ void StartThreadProfiler()
             static LiveSwitch callers("FM2_SAMPLE_CALLERS");
             DWORD64 up[2] = {};
             if (ok && callers)
-            {
-                CONTEXT u = c;
-                for (int k = 0; k < 2; k++)
-                {
-                    DWORD64 imageBase = 0;
-                    auto* fn = RtlLookupFunctionEntry(u.Rip, &imageBase, nullptr);
-                    if (!fn)
-                    {
-                        u.Rip = *reinterpret_cast<DWORD64*>(u.Rsp); // leaf
-                        u.Rsp += 8;
-                    }
-                    else
-                    {
-                        void* handlerData = nullptr;
-                        DWORD64 establisher = 0;
-                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, u.Rip, fn, &u, &handlerData, &establisher, nullptr);
-                    }
-                    up[k] = u.Rip;
-                    if (!u.Rip)
-                        break;
-                }
-            }
+                UnwindCallers(c, up);
             // Symbols are looked up after the thread runs again: the lookups take locks
             // (heap, loader) that the suspended thread may hold.
             ResumeThread(handle);
             if (!ok)
                 continue;
+            // FM2_SAMPLE_RAW=1: each sample logged as fm4.exe offsets (0 outside it), for llvm-symbolizer offline (dbghelp
+            // under Wine names few of a clang PDB's functions). "sample: <rip> <caller> <caller's caller>".
+            if (static const bool raw = getenv("FM2_SAMPLE_RAW") != nullptr; raw)
+            {
+                static const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                auto off = [](DWORD64 a) -> unsigned long long { return a >= base && a < base + 0x40000000 ? a - base : 0; };
+                Log("sample: %llx %llx %llx", off(c.Rip), off(up[0]), off(up[1]));
+                continue;
+            }
             std::string name;
             {
                 alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];

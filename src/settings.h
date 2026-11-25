@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 
 // Player settings: Documents\fm2\settings.ini, edited by the launcher. Environment
@@ -35,6 +36,9 @@ struct Settings
     // Every other key of the file as it is (the launcher's own keys, the racing wheel's wheel_*
     // keys, src/input/wheel/wheel_config.h); kept when the file is saved.
     std::map<std::string, std::string> extra;
+    // The keys settings.ini set (the player's or the launcher's choices); the Steam Deck profile's presets
+    // (src/deck.cpp) fill in only the others.
+    std::set<std::string> fromFile;
     std::string Extra(const char* key) const
     {
         auto it = extra.find(key);

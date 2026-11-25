@@ -1,12 +1,12 @@
 #!/bin/bash
-# Alternated frozen-grid boots: abgrid.sh ROUNDS "label|dir|ENV=v ENV2=v" ...   (dir: release or run)
+# Alternated frozen-grid boots: abgrid.sh ROUNDS "label|dir|ENV=v ENV2=v" ...   (dir: release, run, or a folder under fm4deck)
 # prints one line per boot: label, median fps of the rounds, last perf lite line's GPU ms + draw thread %, mean sensors
 R="/home/deck/claude projects/fm4deck/FM4-Vulkan-WIP"; N="/home/deck/claude projects/fm4deck/run"
 rounds=$1; shift
 for r in $(seq 1 "$rounds"); do
   for spec in "$@"; do
     IFS='|' read -r label dir envs <<< "$spec"
-    [ "$dir" = release ] && D="$R" || D="$N"
+    case "$dir" in release) D="$R";; run) D="$N";; *) D="/home/deck/claude projects/fm4deck/$dir";; esac
     L="$label-$r"
     ( cd "$D" && env $envs tools/deck/grid.sh "$L" 30 8 > /dev/null 2>&1 )
     f="$D/out/$L.txt"

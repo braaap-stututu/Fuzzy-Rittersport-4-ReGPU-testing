@@ -12,9 +12,11 @@ cd "$(dirname "$0")/../.."
 LABEL=${1:-race}
 SECS=${2:-60}
 mkdir -p out
-export FM2_VSYNC=0 FM2_MAX_FPS=1000 REGPU_DEBUG=1 REGPU_DEBUG_PORT=7351 REGPU_VBLANK_HZ=1000 FM4_WHEEL_MODE=off \
+export FM2_VSYNC=0 FM2_MAX_FPS=${BENCH_MAX_FPS:-1000} REGPU_DEBUG=1 REGPU_DEBUG_PORT=7351 REGPU_VBLANK_HZ=${BENCH_VBLANK_HZ:-1000} FM4_WHEEL_MODE=off \
     FM4_GRID_TEST=0 FM4_BENCHMARK=$SECS FM4_AI_PLAYER_LOG=1 REGPU_PERF_LITE=1 REGPU_FRAME_TIMES_SWAP="out/$LABEL.csv"
 export FM2_RESOLUTION=${FM2_RESOLUTION:-1280x800} FM2_MSAA=${FM2_MSAA:-1}
+# BENCH_VBLANK_HZ=real: the vblank rate of real play (twice the frame cap), not the fixed 1000 Hz of the uncapped tests.
+[ "$BENCH_VBLANK_HZ" = real ] && unset REGPU_VBLANK_HZ
 pkill -x fm4.exe 2>/dev/null || true
 sleep 2
 rm -f fm2.log "out/$LABEL.csv"

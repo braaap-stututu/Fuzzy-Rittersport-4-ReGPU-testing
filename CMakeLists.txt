@@ -152,6 +152,14 @@ if(EXISTS "${REGPU_D3DCOMPILER}")
     add_custom_command(TARGET fm4 POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${REGPU_D3DCOMPILER}" $<TARGET_FILE_DIR:fm4>)
 endif()
+# FM4_FRAME_POINTERS=ON: ReGPU + FM4 keep frame pointers, so `perf record --call-graph fp` shows who calls into
+# ntdll (Steam Deck profiling). The recompiled game code is not changed. Off by default.
+option(FM4_FRAME_POINTERS "ReGPU + FM4 with frame pointers (call-graph profiling)" OFF)
+if(FM4_FRAME_POINTERS)
+    foreach(t regpu fm4)
+        target_compile_options(${t} PRIVATE "SHELL:-Xclang -mframe-pointer=all")
+    endforeach()
+endif()
 target_link_libraries(fm4 PRIVATE ${FM4_PPC_LIBS} XenonUtils synchronization winmm onecore)
 target_compile_options(fm4 PRIVATE -mcx16)
 target_compile_definitions(fm4 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)

@@ -18,7 +18,7 @@ while [ $i -lt "$SECONDS_MAX" ]; do
     sclk=$(grep '\*' "$DEV/pp_dpm_sclk" 2>/dev/null | head -1 | sed 's/.*: *\([0-9]*\)Mhz.*/\1/')
     busy=$(cat "$DEV/gpu_busy_percent" 2>/dev/null)
     pw=$(cat "$HW/power1_average" 2>/dev/null || cat "$HW/power1_input" 2>/dev/null)
-    [ -n "$pw" ] && pw=$((pw / 1000000))
+    [ -n "$pw" ] && pw=$(awk -v p="$pw" 'BEGIN {printf "%.1f", p / 1000000}')
     t=$(cat "$HW/temp1_input" 2>/dev/null)
     [ -n "$t" ] && t=$((t / 1000))
     cpu=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -n | tail -1)
