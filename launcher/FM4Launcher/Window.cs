@@ -26,7 +26,8 @@ public static class Web
             .SetContextMenuEnabled(false)
             .SetDevToolsEnabled(System.Diagnostics.Debugger.IsAttached || Environment.GetEnvironmentVariable("FM4_LAUNCHER_DEVTOOLS") == "1")
             .SetJavascriptClipboardAccessEnabled(true)
-            .SetTemporaryFilesPath(Path.Combine(Path.GetTempPath(), "FM4Launcher-webview"))
+            // (the portable package: inside the folder, like everything else)
+            .SetTemporaryFilesPath(Paths.Portable ? Path.Combine(Paths.Root, "user", "launcher-webview") : Path.Combine(Path.GetTempPath(), "FM4Launcher-webview"))
             .RegisterCustomSchemeHandler(Platform.Linux ? "fm4" : "https", Serve);
         if (File.Exists(icon)) w.SetIconFile(icon);
         w.Load(new Uri(Base + page));

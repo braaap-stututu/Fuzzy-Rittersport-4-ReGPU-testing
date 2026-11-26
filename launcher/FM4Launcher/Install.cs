@@ -30,9 +30,39 @@ public static class Paths
     /// (src/user_dir.cpp): if only the old %USERPROFILE%\Documents\fm4 exists, that one.</summary>
     static string? Env(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } v ? v : null;
 
+    /// <summary>The portable package: portable.txt beside fm4.exe keeps everything in user\ beside it, as fm4.exe does
+    /// (src/user_dir.cpp).</summary>
+    public static bool Portable => File.Exists(Path.Combine(Root, "portable.txt"));
+
     static string FindUser()
     {
         if (Env("FM4_USER_DIR") is { } custom) return Path.GetFullPath(custom);
+        var documents = DocumentsUser();
+        if (!Portable) return documents;
+        // The first time, what's in the old place (saves, settings, DLC, caches) is copied in; the original stays.
+        var user = Path.Combine(Root, "user");
+        if (!Directory.Exists(user))
+        {
+            try { if (Directory.Exists(documents)) CopyTree(documents, user); }
+            catch (Exception) { } // a file that can't be read (a OneDrive placeholder offline) is left behind
+            Directory.CreateDirectory(user);
+        }
+        return user;
+    }
+
+    static void CopyTree(string from, string to)
+    {
+        Directory.CreateDirectory(to);
+        foreach (var f in Directory.EnumerateFiles(from))
+        {
+            var dest = Path.Combine(to, Path.GetFileName(f));
+            if (!File.Exists(dest)) File.Copy(f, dest);
+        }
+        foreach (var d in Directory.EnumerateDirectories(from)) CopyTree(d, Path.Combine(to, Path.GetFileName(d)));
+    }
+
+    static string DocumentsUser()
+    {
         // Linux: fm4.exe's Documents is the Proton prefix's.
         if (Platform.Linux) return Path.Combine(CompatData, "pfx", "drive_c", "users", "steamuser", "Documents", "fm4");
         var current = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "fm4");

@@ -305,6 +305,11 @@ the renaming again (`llvm-profdata merge --text`, replace each file's hash with 
 The portable package (fm4.exe PGO + fm4-nopgo.exe, launcher for Windows and Linux, play.sh / play.cmd) was built that
 way and booted on Windows with every switch off and with the defaults; not yet measured on the Deck.
 
+**Portable folder (26 Nov):** `portable.txt` beside fm4.exe keeps the user folder (saves, settings, DLC, shader and
+pipeline caches) in `user` beside it instead of Documents (src/user_dir.cpp; the launcher's Paths.User the same, and its
+WebView2 files in `user/launcher-webview`). The first time, an existing Documents/fm4 is copied in; FM4_USER_DIR still
+wins. The portable package ships the file; an install without it is unchanged.
+
 ## Notes
 
 - A plain `./play.sh` (or `play-deck.sh`) started from a script here, with no window focus, sat at 1 fps after the
